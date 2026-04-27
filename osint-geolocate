@@ -29,7 +29,6 @@ def dms_to_decimal(dms, ref):
     """Convert degrees/minutes/seconds tuple to decimal degrees."""
     try:
         d, m, s = dms
-        # Handle IFDRational objects
         d = float(d)
         m = float(m)
         s = float(s)
@@ -163,11 +162,14 @@ def get_image_mime(path: Path) -> str:
 
 # ─── OLLAMA ──────────────────────────────────────────────────────────────────
 
+# Modèle cloud par défaut — aucun GPU requis, nécessite un compte ollama.com
+OLLAMA_DEFAULT_CLOUD = "gemma4:31b-cloud"
+
 # Ordre de priorité : cloud vision models first (pas de GPU requis),
 # puis fallback local si disponible.
-# gemma4 en tête : vision + thinking + cloud, 5.6M pulls, excellente géo.
 OLLAMA_PREFERRED = [
-    "gemma4",           # vision + thinking + cloud  — défaut recommandé VM
+    "gemma4:31b-cloud", # cloud, aucun GPU requis    — défaut recommandé
+    "gemma4",           # vision + thinking           — fallback sans tag cloud
     "kimi-k2.6",        # vision + thinking + cloud  — agentic, très récent
     "llama3.2-vision",  # local uniquement, GPU requis
     "llava",            # local uniquement, GPU requis
@@ -178,7 +180,7 @@ OLLAMA_PREFERRED = [
 
 # Mots-clés de fallback pour détecter un modèle vision non listé
 VISION_KEYWORDS = ["vision", "llava", "llama3.2", "moondream", "minicpm",
-                   "gemma4", "kimi", "gemini"]
+                   "gemma4", "kimi", "gemini", "cloud"]
 
 # Timeout plus long pour les modèles cloud Ollama (réseau + inférence distante)
 OLLAMA_TIMEOUT = 180
@@ -191,6 +193,14 @@ def ollama_list_models():
         return [m["name"] for m in r.json().get("models", [])]
     except Exception:
         return []
+
+
+def ollama_is_running():
+    try:
+        r = requests.get("http://localhost:11434/api/tags", timeout=5)
+        return r.status_code == 200
+    except Exception:
+        return False
 
 
 def ollama_pick_vision_model(models):
@@ -207,22 +217,22 @@ def ollama_pick_vision_model(models):
 
 
 def analyze_ollama(path: Path, model_override: str = None) -> dict:
-    models = ollama_list_models()
-    if not models:
+    if not ollama_is_running():
         console.print("[red]Ollama non accessible sur localhost:11434[/red]")
         console.print("[dim]Lancez Ollama avec : ollama serve[/dim]")
         sys.exit(1)
 
+    models = ollama_list_models()
+
     if model_override:
         model = model_override
-    else:
+    elif models:
         model = ollama_pick_vision_model(models)
-
-    if not model:
-        console.print("[red]Aucun modèle vision trouvé dans Ollama.[/red]")
-        console.print(f"[dim]Modèles disponibles : {', '.join(models)}[/dim]")
-        console.print("[dim]Installez gemma4 : ollama pull gemma4[/dim]")
-        sys.exit(1)
+    else:
+        # Aucun modèle local — fallback automatique sur le modèle cloud par défaut
+        model = OLLAMA_DEFAULT_CLOUD
+        console.print(f"[dim]Aucun modèle local détecté — utilisation du modèle cloud : {model}[/dim]")
+        console.print(f"[dim yellow]⚠ Les modèles :cloud nécessitent un compte ollama.com (ollama auth login)[/dim yellow]")
 
     # Avertissement si le modèle n'est pas dans la liste préférée vision
     is_known_vision = any(kw in model.lower() for kw in VISION_KEYWORDS)
@@ -250,7 +260,7 @@ def analyze_ollama(path: Path, model_override: str = None) -> dict:
         raw = r.json().get("response", "")
         return parse_ai_response(raw)
     except requests.exceptions.Timeout:
-        console.print("[red]Timeout Ollama (>120s). Modèle trop lent.[/red]")
+        console.print("[red]Timeout Ollama (>180s). Modèle trop lent.[/red]")
         sys.exit(1)
     except Exception as e:
         console.print(f"[red]Erreur Ollama : {e}[/red]")
@@ -301,9 +311,7 @@ def analyze_gemini(path: Path, api_key: str) -> dict:
 
 def parse_ai_response(raw: str) -> dict:
     """Extract JSON from AI response, handling markdown fences."""
-    # Strip markdown code fences
     clean = re.sub(r"```(?:json)?", "", raw).strip()
-    # Find first { ... } block
     match = re.search(r"\{.*\}", clean, re.DOTALL)
     if match:
         try:
@@ -311,11 +319,9 @@ def parse_ai_response(raw: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # Fallback: try to parse the whole string
     try:
         return json.loads(clean)
     except json.JSONDecodeError:
-        # Return raw reasoning as-is
         return {"reasoning": raw, "estimated_lat": None, "estimated_lon": None}
 
 
@@ -331,7 +337,6 @@ def coords_from_analysis(analysis: dict):
     except (ValueError, TypeError):
         pass
 
-    # Try parsing from reasoning text
     reasoning = analysis.get("reasoning", "")
     pattern = r"(-?\d{1,3}\.\d+)[°\s,]+[NS]?\s*[,/]\s*(-?\d{1,3}\.\d+)"
     m = re.search(pattern, reasoning)
@@ -405,19 +410,21 @@ def print_analysis(analysis: dict):
 @click.option("--gemini-key", envvar="GEMINI_API_KEY", default=None,
               help="Gemini API key (or set GEMINI_API_KEY env var)")
 @click.option("--model", default=None,
-              help="Force a specific Ollama model (ex: gemma4, kimi-k2.6)")
+              help="Force a specific Ollama model (ex: gemma4:31b-cloud, llava)")
 @click.option("--no-solar", is_flag=True, default=False, help="Skip solar calculation")
 def main(image, cloud, gemini_key, model, no_solar):
     """
     OSINT image geolocation — EXIF + AI vision + solar analysis.
 
-    Défaut : Ollama avec gemma4 (cloud, vision+thinking, no GPU requis).
+    Défaut : Ollama avec gemma4:31b-cloud (modèle cloud, vision+thinking, no GPU).
+    Nécessite un compte ollama.com et : ollama auth login
     Fallback : Gemini 2.0 Flash avec --cloud.
 
     \b
     Examples:
       osint-geolocate photo.jpg
-      osint-geolocate photo.jpg --model kimi-k2.6
+      osint-geolocate photo.jpg --model gemma4:31b-cloud
+      osint-geolocate photo.jpg --model llava
       osint-geolocate photo.jpg --cloud --gemini-key YOUR_KEY
       GEMINI_API_KEY=xxx osint-geolocate photo.jpg --cloud
     """
@@ -453,7 +460,7 @@ def main(image, cloud, gemini_key, model, no_solar):
         console.print("[dim]Envoi à Gemini 2.0 Flash...[/dim]")
         analysis = analyze_gemini(path, gemini_key)
     else:
-        console.print("[dim]Analyse via Ollama (gemma4 cloud par défaut)...[/dim]")
+        console.print("[dim]Analyse via Ollama (gemma4:31b-cloud par défaut)...[/dim]")
         analysis = analyze_ollama(path, model_override=model)
 
     print_analysis(analysis)
