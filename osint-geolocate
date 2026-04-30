@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 """
-osint-geolocate — Geolocation from image via EXIF + AI vision + solar analysis
+osint-geolocate v2 — EXIF + AI 2-pass + Nominatim + solar
 """
 
-import sys
-import re
-import json
-import base64
-import math
+import sys, re, json, base64, math, urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
-import click
-import requests
+import click, requests
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
-from rich.rule import Rule
 from rich import box
 
 console = Console()
@@ -26,499 +20,486 @@ console = Console()
 # ─── EXIF ────────────────────────────────────────────────────────────────────
 
 def dms_to_decimal(dms, ref):
-    """Convert degrees/minutes/seconds tuple to decimal degrees."""
     try:
-        d, m, s = dms
-        d = float(d)
-        m = float(m)
-        s = float(s)
-        decimal = d + m / 60.0 + s / 3600.0
-        if ref in ("S", "W"):
-            decimal = -decimal
-        return decimal
+        d, m, s = float(dms[0]), float(dms[1]), float(dms[2])
+        v = d + m / 60.0 + s / 3600.0
+        return -v if ref in ("S", "W") else v
     except Exception:
         return None
 
-
-def extract_exif(path: Path):
-    """Return (lat, lon, timestamp) from EXIF or (None, None, None)."""
+def extract_exif(path):
     try:
         img = Image.open(path)
         exif_data = img._getexif()
         if not exif_data:
             return None, None, None
-
-        gps_info = {}
-        timestamp = None
-
+        gps_info, timestamp = {}, None
         for tag_id, value in exif_data.items():
             tag = TAGS.get(tag_id, tag_id)
             if tag == "GPSInfo":
-                for gps_tag_id, gps_val in value.items():
-                    gps_tag = GPSTAGS.get(gps_tag_id, gps_tag_id)
-                    gps_info[gps_tag] = gps_val
-            elif tag == "DateTime":
-                try:
-                    timestamp = datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
-                except Exception:
-                    pass
-            elif tag == "DateTimeOriginal":
-                try:
-                    timestamp = datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
-                except Exception:
-                    pass
-
+                for k, v in value.items():
+                    gps_info[GPSTAGS.get(k, k)] = v
+            elif tag in ("DateTime", "DateTimeOriginal"):
+                try: timestamp = datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+                except: pass
         if not gps_info:
             return None, None, timestamp
-
-        lat = dms_to_decimal(
-            gps_info.get("GPSLatitude"),
-            gps_info.get("GPSLatitudeRef", "N"),
-        )
-        lon = dms_to_decimal(
-            gps_info.get("GPSLongitude"),
-            gps_info.get("GPSLongitudeRef", "E"),
-        )
-
+        lat = dms_to_decimal(gps_info.get("GPSLatitude"), gps_info.get("GPSLatitudeRef", "N"))
+        lon = dms_to_decimal(gps_info.get("GPSLongitude"), gps_info.get("GPSLongitudeRef", "E"))
         return lat, lon, timestamp
-
     except Exception as e:
-        console.print(f"[yellow]EXIF read error: {e}[/yellow]")
+        console.print(f"[yellow]EXIF error: {e}[/yellow]")
         return None, None, None
 
+# ─── SOLAR ───────────────────────────────────────────────────────────────────
 
-# ─── SOLAR ANALYSIS ──────────────────────────────────────────────────────────
-
-def solar_analysis(lat: float, lon: float, timestamp: datetime):
-    """Return a short note about solar consistency."""
+def solar_analysis(lat, lon, timestamp):
     try:
-        import ephem  # type: ignore
-
+        import ephem
         obs = ephem.Observer()
-        obs.lat = str(lat)
-        obs.lon = str(lon)
-        if timestamp.tzinfo is None:
-            obs.date = timestamp.strftime("%Y/%m/%d %H:%M:%S")
-        else:
-            obs.date = timestamp.astimezone(timezone.utc).strftime("%Y/%m/%d %H:%M:%S")
-
+        obs.lat, obs.lon = str(lat), str(lon)
+        obs.date = (timestamp.astimezone(timezone.utc) if timestamp.tzinfo else timestamp).strftime("%Y/%m/%d %H:%M:%S")
         sun = ephem.Sun(obs)
-        alt_deg = math.degrees(float(sun.alt))
-        az_deg = math.degrees(float(sun.az))
-
-        if alt_deg < 0:
-            return f"Soleil sous l'horizon à cette heure ({alt_deg:.1f}°) — nuit probable"
-        return f"Soleil à {alt_deg:.1f}° d'altitude, azimut {az_deg:.1f}°"
-
+        alt, az = math.degrees(float(sun.alt)), math.degrees(float(sun.az))
+        if alt < 0:
+            return f"Soleil sous l'horizon ({alt:.1f}°) — nuit/crépuscule"
+        return f"Soleil à {alt:.1f}° altitude, azimut {az:.1f}°"
     except ImportError:
-        return "Module ephem non disponible"
+        return "ephem non installé"
     except Exception as e:
         return f"Calcul impossible ({e})"
 
+# ─── NOMINATIM ───────────────────────────────────────────────────────────────
 
-# ─── AI PROMPT ───────────────────────────────────────────────────────────────
+def nominatim_geocode(query):
+    if not query or len(query.strip()) < 3:
+        return None, None, None
+    try:
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": query, "format": "json", "limit": 1},
+            headers={"User-Agent": "osint-geolocate/2.0"},
+            timeout=10
+        )
+        r.raise_for_status()
+        res = r.json()
+        if res:
+            return float(res[0]["lat"]), float(res[0]["lon"]), res[0].get("display_name", query)
+    except Exception:
+        pass
+    return None, None, None
 
-VISION_PROMPT = """You are an expert OSINT geolocation analyst. Analyze this image and extract every geographic clue.
+def build_geocode_query(analysis):
+    city    = (analysis.get("estimated_city") or "").strip()
+    country = (analysis.get("estimated_country") or "").strip()
+    region  = (analysis.get("estimated_region") or "").strip()
+    lms     = analysis.get("landmarks", [])
+    top_lm  = sorted(lms, key=lambda x: x.get("confidence", 0), reverse=True)[0].get("name", "").strip() if lms else ""
+    if city and country:    return f"{city}, {country}"
+    if top_lm and country:  return f"{top_lm}, {country}"
+    if city:                return city
+    if top_lm:              return top_lm
+    if region and country:  return f"{region}, {country}"
+    return country or region
 
-Respond ONLY with a JSON object — no markdown, no code fences, no preamble:
+# ─── PROMPTS (3 PASSES) ──────────────────────────────────────────────────────
+
+PROMPT_PASS0 = """You are an expert image analyst. Describe everything you see in this image in full detail, as if explaining to someone who cannot see it.
+
+Respond ONLY with JSON, no markdown, no preamble:
 
 {
-  "landmarks": [{"name": "...", "confidence": 0.0}],
-  "language": "...",
-  "architecture_style": "...",
+  "scene_type": "outdoor/indoor/aerial/...",
+  "description": "complete natural language description of the full scene",
+  "main_subject": "what is the main subject or focus",
+  "setting": "urban/rural/suburban/industrial/natural/...",
+  "time_of_day": "dawn/morning/midday/afternoon/evening/night/unknown",
+  "season": "spring/summer/autumn/winter/unknown",
+  "weather": "sunny/cloudy/rainy/foggy/snowy/unknown",
+  "dominant_colors": "main colors present in scene",
+  "people_present": false,
+  "vehicles_present": false,
+  "text_present": false,
+  "notable_elements": ["element1", "element2", "element3"],
+  "image_quality": "high/medium/low",
+  "perspective": "street level/elevated/aerial/interior/..."
+}"""
+
+PROMPT_PASS1 = """You are an elite OSINT analyst specializing in image geolocation.
+
+SCENE DESCRIPTION (from previous analysis):
+{description}
+
+PASS 1 — Now extract ALL geographic clues from the image. Be exhaustive and precise.
+
+Respond ONLY with JSON, no markdown, no preamble:
+
+{
+  "landmarks": [{"name": "...", "confidence": 0.0, "detail": "..."}],
+  "text_visible": "exact text seen on signs, plaques, labels",
+  "language_script": "...",
+  "architecture": {
+    "style": "...", "era": "...", "materials": "...",
+    "roof_type": "...", "window_style": "...", "balcony_style": "..."
+  },
+  "infrastructure": {
+    "road_markings": "...", "traffic_signs_style": "...",
+    "traffic_lights_style": "...", "license_plates": "...",
+    "fire_hydrant_style": "...", "utility_poles": "...",
+    "mailbox_style": "...", "street_furniture": "..."
+  },
   "vegetation": "...",
-  "signage": "...",
-  "flags_or_emblems": "...",
-  "climate_zone": "...",
-  "estimated_region": "...",
+  "climate_clues": "...",
+  "sky_and_light": "season, time of day, sun angle, shadow direction",
+  "people_clothing": "...",
+  "flags_emblems_coats_of_arms": "...",
+  "vehicles": "brands, models, steering side",
+  "cultural_clues": "religious, cultural or regional markers"
+}"""
+
+PROMPT_PASS2 = """You are an elite OSINT geolocation analyst.
+
+Based on these visual clues extracted from an image, determine the most precise location.
+
+CLUES:
+{clues}
+
+Think step by step:
+1. Country: based on text/language/script/flags/plates
+2. Region/City: based on architecture + infrastructure + vegetation
+3. Specific landmark or building?
+4. Cross-check all clues for consistency
+
+Respond ONLY with JSON, no markdown, no preamble:
+
+{{
   "estimated_country": "...",
+  "estimated_region": "...",
   "estimated_city": "...",
+  "estimated_district": "...",
+  "estimated_street": "...",
   "estimated_lat": null,
   "estimated_lon": null,
-  "reasoning": "..."
-}
+  "confidence_level": "high/medium/low",
+  "key_clues_used": ["clue1", "clue2", "clue3"],
+  "reasoning": "step by step reasoning",
+  "alternative_locations": ["alt1", "alt2"]
+}}
 
-Rules:
-- Be precise about estimated_lat / estimated_lon (decimal degrees) when you have strong indicators.
-- Set them to null if genuinely uncertain.
-- confidence is 0.0 to 1.0.
-- Keep all string values concise (one line each).
-"""
-
-
-def image_to_base64(path: Path) -> str:
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
-
-
-def get_image_mime(path: Path) -> str:
-    suffix = path.suffix.lower()
-    return {
-        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-        ".png": "image/png", ".webp": "image/webp",
-        ".gif": "image/gif",
-    }.get(suffix, "image/jpeg")
-
+- estimated_lat/lon decimal degrees, null if uncertain
+- high = city level, medium = region level, low = country only"""
 
 # ─── OLLAMA ──────────────────────────────────────────────────────────────────
 
-# Modèle cloud par défaut — aucun GPU requis, nécessite un compte ollama.com
-OLLAMA_DEFAULT_CLOUD = "gemma4:31b-cloud"
+DEFAULT_MODEL  = "gemma4:31b-cloud"
+OLLAMA_TIMEOUT = 300  # 3 passes x modèle 31b cloud
 
-# Ordre de priorité : cloud vision models first (pas de GPU requis),
-# puis fallback local si disponible.
-OLLAMA_PREFERRED = [
-    "gemma4:31b-cloud", # cloud, aucun GPU requis    — défaut recommandé
-    "gemma4",           # vision + thinking           — fallback sans tag cloud
-    "kimi-k2.6",        # vision + thinking + cloud  — agentic, très récent
-    "llama3.2-vision",  # local uniquement, GPU requis
-    "llava",            # local uniquement, GPU requis
-    "llava:13b",
-    "minicpm-v",
-    "moondream",
-]
+def image_to_b64(path):
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
 
-# Mots-clés de fallback pour détecter un modèle vision non listé
-VISION_KEYWORDS = ["vision", "llava", "llama3.2", "moondream", "minicpm",
-                   "gemma4", "kimi", "gemini", "cloud"]
+def get_mime(path):
+    return {".jpg":"image/jpeg",".jpeg":"image/jpeg",".png":"image/png",
+            ".webp":"image/webp",".gif":"image/gif"}.get(Path(path).suffix.lower(),"image/jpeg")
 
-# Timeout plus long pour les modèles cloud Ollama (réseau + inférence distante)
-OLLAMA_TIMEOUT = 180
-
-
-def ollama_list_models():
+def ollama_ping():
     try:
         r = requests.get("http://localhost:11434/api/tags", timeout=5)
         r.raise_for_status()
-        return [m["name"] for m in r.json().get("models", [])]
-    except Exception:
-        return []
+        return True
+    except: return False
 
+def ollama_call(model, prompt, b64=None):
+    payload = {"model": model, "prompt": prompt, "stream": False, "options": {"temperature": 0.1}}
+    if b64: payload["images"] = [b64]
+    r = requests.post("http://localhost:11434/api/generate", json=payload, timeout=OLLAMA_TIMEOUT)
+    r.raise_for_status()
+    return r.json().get("response", "")
 
-def ollama_is_running():
-    try:
-        r = requests.get("http://localhost:11434/api/tags", timeout=5)
-        return r.status_code == 200
-    except Exception:
-        return False
-
-
-def ollama_pick_vision_model(models):
-    for preferred in OLLAMA_PREFERRED:
-        for m in models:
-            if preferred in m.lower():
-                return m
-    # Fallback: keyword scan
-    for m in models:
-        for kw in VISION_KEYWORDS:
-            if kw in m.lower():
-                return m
-    return models[0] if models else None
-
-
-def analyze_ollama(path: Path, model_override: str = None) -> dict:
-    if not ollama_is_running():
+def analyze_ollama(path, model_override=None):
+    if not ollama_ping():
         console.print("[red]Ollama non accessible sur localhost:11434[/red]")
-        console.print("[dim]Lancez Ollama avec : ollama serve[/dim]")
+        console.print("[dim]Lancez : ollama serve[/dim]")
         sys.exit(1)
+    model = model_override or DEFAULT_MODEL
+    console.print(f"[dim]Modèle : {model}[/dim]")
+    b64 = image_to_b64(path)
 
-    models = ollama_list_models()
+    console.print("[dim cyan]Passe 1/3 — description visuelle générale...[/dim cyan]")
+    raw0  = ollama_call(model, PROMPT_PASS0, b64)
+    scene = parse_response(raw0)
 
-    if model_override:
-        model = model_override
-    elif models:
-        model = ollama_pick_vision_model(models)
-    else:
-        # Aucun modèle local — fallback automatique sur le modèle cloud par défaut
-        model = OLLAMA_DEFAULT_CLOUD
-        console.print(f"[dim]Aucun modèle local détecté — utilisation du modèle cloud : {model}[/dim]")
-        console.print(f"[dim yellow]⚠ Les modèles :cloud nécessitent un compte ollama.com (ollama auth login)[/dim yellow]")
+    console.print("[dim cyan]Passe 2/3 — extraction des indices géographiques...[/dim cyan]")
+    desc  = scene.get("description", json.dumps(scene, ensure_ascii=False))
+    raw1  = ollama_call(model, PROMPT_PASS1.format(description=desc), b64)
+    clues = parse_response(raw1)
 
-    # Avertissement si le modèle n'est pas dans la liste préférée vision
-    is_known_vision = any(kw in model.lower() for kw in VISION_KEYWORDS)
-    if not is_known_vision:
-        console.print(f"[yellow]⚠ '{model}' n'est pas un modèle vision connu — les résultats peuvent être dégradés.[/yellow]")
-
-    console.print(f"[dim]Modèle Ollama : {model}[/dim]")
-
-    b64 = image_to_base64(path)
-    payload = {
-        "model": model,
-        "prompt": VISION_PROMPT,
-        "images": [b64],
-        "stream": False,
-        "options": {"temperature": 0.1},
-    }
-
-    try:
-        r = requests.post(
-            "http://localhost:11434/api/generate",
-            json=payload,
-            timeout=OLLAMA_TIMEOUT,
-        )
-        r.raise_for_status()
-        raw = r.json().get("response", "")
-        return parse_ai_response(raw)
-    except requests.exceptions.Timeout:
-        console.print("[red]Timeout Ollama (>180s). Modèle trop lent.[/red]")
-        sys.exit(1)
-    except Exception as e:
-        console.print(f"[red]Erreur Ollama : {e}[/red]")
-        sys.exit(1)
-
+    console.print("[dim cyan]Passe 3/3 — raisonnement géographique...[/dim cyan]")
+    prompt2 = PROMPT_PASS2.format(clues=json.dumps({**scene, **clues}, ensure_ascii=False, indent=2))
+    raw2    = ollama_call(model, prompt2)
+    geo     = parse_response(raw2)
+    return {**scene, **clues, **geo, "_scene": scene}
 
 # ─── GEMINI ──────────────────────────────────────────────────────────────────
 
-def analyze_gemini(path: Path, api_key: str) -> dict:
-    b64 = image_to_base64(path)
-    mime = get_image_mime(path)
+def gemini_call(api_key, prompt, b64=None, mime="image/jpeg"):
+    url   = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+    parts = [{"text": prompt}]
+    if b64: parts.append({"inline_data": {"mime_type": mime, "data": b64}})
+    r = requests.post(url, json={"contents":[{"parts":parts}],
+        "generationConfig":{"temperature":0.1,"maxOutputTokens":2048}}, timeout=60)
+    r.raise_for_status()
+    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.0-flash:generateContent?key={api_key}"
-    )
+def analyze_gemini(path, api_key):
+    b64, mime = image_to_b64(path), get_mime(path)
 
-    payload = {
-        "contents": [{
-            "parts": [
-                {"text": VISION_PROMPT},
-                {"inline_data": {"mime_type": mime, "data": b64}},
-            ]
-        }],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1024},
-    }
-
+    console.print("[dim cyan]Passe 1/3 — description visuelle générale (Gemini)...[/dim cyan]")
     try:
-        r = requests.post(url, json=payload, timeout=60)
-        r.raise_for_status()
-        data = r.json()
-        raw = data["candidates"][0]["content"]["parts"][0]["text"]
-        return parse_ai_response(raw)
+        raw0  = gemini_call(api_key, PROMPT_PASS0, b64, mime)
+        scene = parse_response(raw0)
     except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 400:
-            console.print("[red]Clé Gemini invalide ou quota dépassé.[/red]")
-        elif e.response.status_code == 403:
-            console.print("[red]Accès refusé — vérifiez votre clé API Gemini.[/red]")
-        else:
-            console.print(f"[red]Erreur HTTP Gemini {e.response.status_code}[/red]")
-        sys.exit(1)
-    except Exception as e:
-        console.print(f"[red]Erreur Gemini : {e}[/red]")
+        console.print(f"[red]Gemini error {e.response.status_code}[/red]")
         sys.exit(1)
 
-
-# ─── RESPONSE PARSER ─────────────────────────────────────────────────────────
-
-def parse_ai_response(raw: str) -> dict:
-    """Extract JSON from AI response, handling markdown fences."""
-    clean = re.sub(r"```(?:json)?", "", raw).strip()
-    match = re.search(r"\{.*\}", clean, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
-
+    console.print("[dim cyan]Passe 2/3 — extraction des indices géographiques (Gemini)...[/dim cyan]")
+    desc  = scene.get("description", json.dumps(scene, ensure_ascii=False))
     try:
-        return json.loads(clean)
-    except json.JSONDecodeError:
-        return {"reasoning": raw, "estimated_lat": None, "estimated_lon": None}
+        raw1  = gemini_call(api_key, PROMPT_PASS1.format(description=desc), b64, mime)
+        clues = parse_response(raw1)
+    except Exception as e:
+        console.print(f"[yellow]Passe 2 échouée : {e}[/yellow]")
+        return scene
 
+    console.print("[dim cyan]Passe 3/3 — raisonnement géographique (Gemini)...[/dim cyan]")
+    prompt2 = PROMPT_PASS2.format(clues=json.dumps({**scene, **clues}, ensure_ascii=False, indent=2))
+    try:
+        raw2 = gemini_call(api_key, prompt2)
+        geo  = parse_response(raw2)
+        return {**scene, **clues, **geo, "_scene": scene}
+    except Exception as e:
+        console.print(f"[yellow]Passe 3 échouée : {e}[/yellow]")
+        return {**scene, **clues}
 
-# ─── COORDINATE EXTRACTION ───────────────────────────────────────────────────
+# ─── PARSER ──────────────────────────────────────────────────────────────────
 
-def coords_from_analysis(analysis: dict):
-    """Try to get (lat, lon) from the AI analysis dict."""
-    lat = analysis.get("estimated_lat")
-    lon = analysis.get("estimated_lon")
+def parse_response(raw):
+    clean = re.sub(r"```(?:json)?", "", raw).strip()
+    m = re.search(r"\{.*\}", clean, re.DOTALL)
+    if m:
+        try: return json.loads(m.group())
+        except: pass
+    try: return json.loads(clean)
+    except: return {"reasoning": raw, "estimated_lat": None, "estimated_lon": None}
+
+def coords_from(analysis):
+    lat, lon = analysis.get("estimated_lat"), analysis.get("estimated_lon")
     try:
         if lat is not None and lon is not None:
             return float(lat), float(lon)
-    except (ValueError, TypeError):
-        pass
-
-    reasoning = analysis.get("reasoning", "")
-    pattern = r"(-?\d{1,3}\.\d+)[°\s,]+[NS]?\s*[,/]\s*(-?\d{1,3}\.\d+)"
-    m = re.search(pattern, reasoning)
-    if m:
-        return float(m.group(1)), float(m.group(2))
-
+    except: pass
+    m = re.search(r"(-?\d{1,3}\.\d+)[°\s,]+[NS]?\s*[,/]\s*(-?\d{1,3}\.\d+)",
+                  analysis.get("reasoning",""))
+    if m: return float(m.group(1)), float(m.group(2))
     return None, None
 
+# ─── OUTPUT ──────────────────────────────────────────────────────────────────
 
-# ─── RICH OUTPUT ─────────────────────────────────────────────────────────────
-
-def tag(label: str, color: str = "cyan") -> Text:
+def ps(label, content, color="cyan"):
     t = Text()
-    t.append(f"[{label}]", style=f"bold {color}")
-    return t
+    t.append(f"[{label:<8}]", style=f"bold {color}")
+    t.append(f"  {content}")
+    console.print(t)
 
+def nonempty(v):
+    return v and str(v).lower().strip() not in ("", "none", "null", "n/a", "unknown")
 
-def print_section(label: str, content: str, color: str = "cyan"):
-    prefix = Text()
-    prefix.append(f"[{label:<7}]", style=f"bold {color}")
-    prefix.append(f"  {content}")
-    console.print(prefix)
+def print_clues(a):
+    # ── Passe 0 : description générale ──────────────────────────────────
+    scene = a.get("_scene", {})
+    desc  = scene.get("description") or a.get("description", "")
+    if desc and len(desc) > 10:
+        console.print(Panel(
+            f"[white]{desc}[/white]",
+            title="[bold dim]DESCRIPTION VISUELLE[/bold dim]",
+            box=box.SIMPLE, style="dim", padding=(0, 2)
+        ))
+        console.print()
 
-
-def print_header(image_path: Path):
-    console.print()
-    console.print(
-        Panel(
-            f"[bold white]OSINT-GEOLOCATE[/bold white]  [dim]{image_path.name}[/dim]",
-            box=box.DOUBLE_EDGE,
-            style="bright_blue",
-            padding=(0, 2),
-        )
-    )
-    console.print()
-
-
-def print_analysis(analysis: dict):
-    landmarks = analysis.get("landmarks", [])
-    if landmarks:
-        top = sorted(landmarks, key=lambda x: x.get("confidence", 0), reverse=True)[:3]
-        lm_str = ", ".join(
-            f"{l['name']} ({int(l.get('confidence', 0) * 100)}%)" for l in top
-        )
-        print_section("VISUAL", f"Landmarks  : {lm_str}", "green")
-    else:
-        print_section("VISUAL", "Aucun landmark identifié", "green")
-
-    for field, label in [
-        ("language", "Langue      "),
-        ("architecture_style", "Architecture"),
-        ("vegetation", "Végétation  "),
-        ("signage", "Signalisation"),
-        ("flags_or_emblems", "Drapeaux    "),
-        ("climate_zone", "Climat      "),
+    for key, label in [
+        ("scene_type",  "Type de scène"),
+        ("setting",     "Environnement"),
+        ("time_of_day", "Heure approx."),
+        ("season",      "Saison        "),
+        ("weather",     "Météo         "),
+        ("perspective", "Perspective   "),
     ]:
-        val = analysis.get(field)
-        if val and val.lower() not in ("none", "unknown", "n/a", "null", ""):
-            print_section("VISUAL", f"{label} : {val}", "green")
+        v = scene.get(key) or a.get(key, "")
+        if nonempty(v):
+            ps("SCÈNE", f"{label} : {v}", "dim white")
 
-    reasoning = analysis.get("reasoning")
-    if reasoning and len(reasoning) < 300:
-        print_section("VISUAL", f"Raisonnement: {reasoning}", "dim green")
+    notables = scene.get("notable_elements") or a.get("notable_elements", [])
+    if notables:
+        ps("SCÈNE", f"Éléments     : {', '.join(notables[:6])}", "dim white")
 
+    console.print()
 
-# ─── MAIN ────────────────────────────────────────────────────────────────────
+    # ── Passes 1 & 2 : indices géo ──────────────────────────────────────
+    lms = a.get("landmarks", [])
+    if lms:
+        top = sorted(lms, key=lambda x: x.get("confidence",0), reverse=True)[:3]
+        ps("VISUAL", "Landmarks    : " + ", ".join(f"{l['name']} ({int(l.get('confidence',0)*100)}%)" for l in top), "green")
+
+    for key, label in [
+        ("text_visible",              "Texte visible"),
+        ("language_script",           "Langue/Script"),
+        ("flags_emblems_coats_of_arms","Drapeaux/Arms"),
+        ("vehicles",                  "Véhicules    "),
+        ("cultural_clues",            "Culturel     "),
+        ("vegetation",                "Végétation   "),
+        ("climate_clues",             "Climat       "),
+        ("sky_and_light",             "Lumière/Ombre"),
+    ]:
+        v = a.get(key, "")
+        if nonempty(v):
+            ps("VISUAL", f"{label} : {v}", "green")
+
+    arch = a.get("architecture", {})
+    if isinstance(arch, dict):
+        parts = [f"{k}: {v}" for k, v in arch.items() if nonempty(v)]
+        if parts: ps("VISUAL", "Architecture : " + " | ".join(parts), "green")
+
+    infra = a.get("infrastructure", {})
+    if isinstance(infra, dict):
+        parts = [f"{k}: {v}" for k, v in infra.items() if nonempty(v)]
+        if parts: ps("VISUAL", "Infra        : " + " | ".join(parts[:5]), "green")
+
+    key_clues = a.get("key_clues_used", [])
+    if key_clues:
+        ps("REASON", "Indices clés : " + ", ".join(key_clues[:5]), "cyan")
+
+    conf = a.get("confidence_level", "")
+    if conf:
+        color = {"high": "bright_green", "medium": "yellow", "low": "red"}.get(conf, "white")
+        ps("REASON", f"Confiance    : {conf.upper()}", color)
+
+    alts = a.get("alternative_locations", [])
+    if alts:
+        ps("REASON", "Alternatives : " + " | ".join(alts[:3]), "dim cyan")
+
+    reason = a.get("reasoning", "")
+    if reason and len(reason) < 500:
+        ps("REASON", f"Analyse      : {reason}", "dim cyan")
+
+def print_result(lat, lon, label, source=""):
+    maps_url   = f"https://maps.google.com/?q={lat:.6f},{lon:.6f}"
+    osm_url    = f"https://www.openstreetmap.org/?mlat={lat:.6f}&mlon={lon:.6f}&zoom=15"
+    yandex_url = "https://yandex.com/images/search?rpt=imageview"
+
+    src_str = f"  [dim]({source})[/dim]" if source else ""
+    console.print(Panel(
+        f"[bold green]→ {label}[/bold green]{src_str}\n"
+        f"[white]   {abs(lat):.5f}° {'N' if lat>=0 else 'S'},  {abs(lon):.5f}° {'E' if lon>=0 else 'W'}[/white]",
+        box=box.ROUNDED, style="green", padding=(0,2)
+    ))
+    console.print()
+    for lbl, url, color in [("MAPS   ", maps_url,"bright_blue"),("OSM    ",osm_url,"bright_cyan"),("YANDEX ",yandex_url,"yellow")]:
+        t = Text()
+        t.append(f"[{lbl}]  ", style=f"bold {color}")
+        t.append(url, style=f"{color} underline")
+        console.print(t)
+    console.print()
+    console.print("[dim]  Yandex → glisser-déposer la photo pour reverse image search[/dim]")
+    console.print()
+
+# ─── CLI ─────────────────────────────────────────────────────────────────────
 
 @click.command()
 @click.argument("image", type=click.Path(exists=True, readable=True))
-@click.option("--cloud", is_flag=True, help="Use Gemini 2.0 Flash instead of Ollama")
-@click.option("--gemini-key", envvar="GEMINI_API_KEY", default=None,
-              help="Gemini API key (or set GEMINI_API_KEY env var)")
-@click.option("--model", default=None,
-              help="Force a specific Ollama model (ex: gemma4:31b-cloud, llava)")
-@click.option("--no-solar", is_flag=True, default=False, help="Skip solar calculation")
-def main(image, cloud, gemini_key, model, no_solar):
-    """
-    OSINT image geolocation — EXIF + AI vision + solar analysis.
 
-    Défaut : Ollama avec gemma4:31b-cloud (modèle cloud, vision+thinking, no GPU).
-    Nécessite un compte ollama.com et : ollama auth login
-    Fallback : Gemini 2.0 Flash avec --cloud.
+
+@click.option("--model", default=None, help="Forcer un modèle Ollama (défaut: gemma4:31b-cloud)")
+@click.option("--no-solar",   is_flag=True, default=False, help="Désactiver calcul solaire")
+@click.option("--no-geocode", is_flag=True, default=False, help="Désactiver Nominatim")
+def main(image, model, no_solar, no_geocode):
+    """
+    OSINT image geolocation v2 — EXIF + AI 3-pass + Nominatim + solar.
+
+    Moteur : Ollama + gemma4:31b-cloud (aucun GPU requis).
 
     \b
-    Examples:
+    Exemples:
       osint-geolocate photo.jpg
-      osint-geolocate photo.jpg --model gemma4:31b-cloud
-      osint-geolocate photo.jpg --model llava
-      osint-geolocate photo.jpg --cloud --gemini-key YOUR_KEY
-      GEMINI_API_KEY=xxx osint-geolocate photo.jpg --cloud
+      osint-geolocate photo.jpg --model gemma4:27b-cloud
+      osint-geolocate photo.jpg --no-solar
     """
     path = Path(image)
-    print_header(path)
+    console.print()
+    console.print(Panel(
+        f"[bold white]OSINT-GEOLOCATE v2[/bold white]  [dim]{path.name}[/dim]",
+        box=box.DOUBLE_EDGE, style="bright_blue", padding=(0,2)
+    ))
+    console.print()
 
-    # ── STEP 1: EXIF ──────────────────────────────────────────────────────
+    # 1. EXIF
     lat, lon, timestamp = extract_exif(path)
-
     if lat is not None and lon is not None:
-        print_section("EXIF", f"GPS trouvé : {lat:.6f}° N, {lon:.6f}° E", "bright_cyan")
-        if timestamp:
-            print_section("EXIF", f"Date/heure : {timestamp.strftime('%Y-%m-%d %H:%M:%S')}", "bright_cyan")
+        ps("EXIF", f"GPS trouvé : {lat:.6f}°, {lon:.6f}°", "bright_cyan")
+        if timestamp: ps("EXIF", f"Timestamp  : {timestamp.strftime('%Y-%m-%d %H:%M:%S')}", "bright_cyan")
         console.print()
-        _print_result(lat, lon, "EXIF GPS")
+        print_result(lat, lon, "Coordonnées EXIF", "GPS")
         return
-    else:
-        print_section("EXIF", "Aucune donnée GPS trouvée", "yellow")
-        if timestamp:
-            print_section("EXIF", f"Timestamp  : {timestamp.strftime('%Y-%m-%d %H:%M:%S')}", "dim yellow")
-
+    ps("EXIF", "Aucune donnée GPS", "yellow")
+    if timestamp: ps("EXIF", f"Timestamp  : {timestamp.strftime('%Y-%m-%d %H:%M:%S')}", "dim yellow")
     console.print()
 
-    # ── STEP 2: AI VISION ─────────────────────────────────────────────────
-    if cloud:
-        if not gemini_key:
-            console.print(
-                "[red]--cloud nécessite une clé Gemini.[/red]\n"
-                "[dim]Passez --gemini-key KEY ou exportez GEMINI_API_KEY=...[/dim]\n"
-                "[dim]Clé gratuite sur : https://aistudio.google.com/apikey[/dim]"
-            )
-            sys.exit(1)
-        console.print("[dim]Envoi à Gemini 2.0 Flash...[/dim]")
-        analysis = analyze_gemini(path, gemini_key)
-    else:
-        console.print("[dim]Analyse via Ollama (gemma4:31b-cloud par défaut)...[/dim]")
-        analysis = analyze_ollama(path, model_override=model)
+    # 2. AI 3-pass — Ollama gemma4:31b-cloud
+    analysis = analyze_ollama(path, model_override=model)
 
-    print_analysis(analysis)
+    console.print()
+    print_clues(analysis)
     console.print()
 
-    ai_lat, ai_lon = coords_from_analysis(analysis)
+    ai_lat, ai_lon = coords_from(analysis)
 
-    # ── STEP 3: SOLAR ─────────────────────────────────────────────────────
-    if not no_solar and timestamp and ai_lat is not None:
-        solar_note = solar_analysis(ai_lat, ai_lon, timestamp)
-        print_section("SOLAR", solar_note, "magenta")
-        console.print()
-    elif not no_solar:
-        print_section("SOLAR", "Timestamp ou coordonnées manquants — calcul ignoré", "dim magenta")
+    # 3. Nominatim fallback
+    nom_lat, nom_lon, nom_name = None, None, None
+    if not no_geocode and (ai_lat is None or ai_lon is None):
+        query = build_geocode_query(analysis)
+        if query:
+            console.print(f"[dim]Géocodage Nominatim : \"{query}\"...[/dim]")
+            nom_lat, nom_lon, nom_name = nominatim_geocode(query)
+            if nom_lat:
+                ps("GEOCODE", f"Résultat    : {nom_name}", "bright_magenta")
+                ps("GEOCODE", f"Coordonnées : {nom_lat:.5f}°, {nom_lon:.5f}°", "bright_magenta")
+                console.print()
+
+    final_lat = ai_lat if ai_lat is not None else nom_lat
+    final_lon = ai_lon if ai_lon is not None else nom_lon
+    source    = "IA" if ai_lat is not None else ("Nominatim" if nom_lat else "")
+
+    # 4. Solar
+    if not no_solar and timestamp and final_lat is not None:
+        ps("SOLAR", solar_analysis(final_lat, final_lon, timestamp), "magenta")
         console.print()
 
-    # ── STEP 4: RESULT ────────────────────────────────────────────────────
-    city = analysis.get("estimated_city") or ""
+    # 5. Result
+    city    = analysis.get("estimated_city") or ""
     country = analysis.get("estimated_country") or ""
-    region = analysis.get("estimated_region") or ""
+    region  = analysis.get("estimated_region") or ""
+    label   = ", ".join(filter(None, [city, country or region])) or "Estimation IA"
 
-    location_str = ", ".join(filter(None, [city, country or region]))
-
-    if ai_lat is not None and ai_lon is not None:
-        _print_result(ai_lat, ai_lon, location_str or "Estimation IA")
+    if final_lat is not None and final_lon is not None:
+        print_result(final_lat, final_lon, label, source)
     else:
-        console.print(
-            Panel(
-                "[yellow]Coordonnées insuffisamment précises pour générer un lien.[/yellow]\n"
-                f"[dim]Région estimée : {location_str or 'Inconnue'}[/dim]",
-                box=box.ROUNDED,
-                style="yellow",
-            )
-        )
-
-    console.print()
-
-
-def _print_result(lat: float, lon: float, label: str):
-    maps_url = f"https://maps.google.com/?q={lat:.6f},{lon:.6f}"
-
-    console.print(
-        Panel(
-            f"[bold green]→ {label}[/bold green]\n"
-            f"[white]   {lat:.4f}° {'N' if lat >= 0 else 'S'},  "
-            f"{abs(lon):.4f}° {'E' if lon >= 0 else 'W'}[/white]",
-            box=box.ROUNDED,
-            style="green",
-            padding=(0, 2),
-        )
-    )
-    console.print()
-    prefix = Text()
-    prefix.append("[MAPS]  ", style="bold bright_blue")
-    prefix.append(maps_url, style="bright_blue underline")
-    console.print(prefix)
-    console.print()
-
+        console.print(Panel(
+            "[yellow]Coordonnées non déterminées.[/yellow]\n"
+            f"[dim]Région estimée : {label or 'Inconnue'}[/dim]\n\n"
+            "[white]→ Reverse image search :[/white]\n"
+            "[yellow underline]https://yandex.com/images/search?rpt=imageview[/yellow underline]",
+            box=box.ROUNDED, style="yellow"
+        ))
+        console.print()
 
 if __name__ == "__main__":
     main()
