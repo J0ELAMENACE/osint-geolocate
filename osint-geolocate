@@ -1,49 +1,50 @@
 #!/usr/bin/env python3
-"""
-osint-geolocate v2 — EXIF + AI 2-pass + Nominatim + solar
-"""
-
-import sys, re, json, base64, math, urllib.parse
+"""osint-geolocate v3 - Multi-model pipeline + Picarta API"""
+import sys, re, json, base64, math, time
 from datetime import datetime, timezone
 from pathlib import Path
-
 import click, requests
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
+from rich.rule import Rule
 from rich import box
 
 console = Console()
+MODEL_OCR  = "qwen3.5:27b"
+MODEL_GEO  = "gemma4:31b"
+MODEL_REAS = "kimi-k2.6"
+OLLAMA_TIMEOUT = 480
 
-# ─── EXIF ────────────────────────────────────────────────────────────────────
+try:
+    from duckduckgo_search import DDGS
+    DDG_AVAILABLE = True
+except ImportError:
+    DDG_AVAILABLE = False
 
 def dms_to_decimal(dms, ref):
     try:
         d, m, s = float(dms[0]), float(dms[1]), float(dms[2])
         v = d + m / 60.0 + s / 3600.0
         return -v if ref in ("S", "W") else v
-    except Exception:
-        return None
+    except: return None
 
 def extract_exif(path):
     try:
         img = Image.open(path)
         exif_data = img._getexif()
-        if not exif_data:
-            return None, None, None
+        if not exif_data: return None, None, None
         gps_info, timestamp = {}, None
         for tag_id, value in exif_data.items():
             tag = TAGS.get(tag_id, tag_id)
             if tag == "GPSInfo":
-                for k, v in value.items():
-                    gps_info[GPSTAGS.get(k, k)] = v
+                for k, v in value.items(): gps_info[GPSTAGS.get(k, k)] = v
             elif tag in ("DateTime", "DateTimeOriginal"):
                 try: timestamp = datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
                 except: pass
-        if not gps_info:
-            return None, None, timestamp
+        if not gps_info: return None, None, timestamp
         lat = dms_to_decimal(gps_info.get("GPSLatitude"), gps_info.get("GPSLatitudeRef", "N"))
         lon = dms_to_decimal(gps_info.get("GPSLongitude"), gps_info.get("GPSLongitudeRef", "E"))
         return lat, lon, timestamp
@@ -51,7 +52,33 @@ def extract_exif(path):
         console.print(f"[yellow]EXIF error: {e}[/yellow]")
         return None, None, None
 
-# ─── SOLAR ───────────────────────────────────────────────────────────────────
+def picarta_geolocate(path, api_token, top_k=5):
+    try:
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        payload = {"TOKEN": api_token, "IMAGE": b64, "TOP_K": top_k}
+        r = requests.post("https://picarta.ai/classify", json=payload,
+                          headers={"Content-Type": "application/json"}, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        candidates = []
+        preds = data.get("topk_predictions_dict", {})
+        for k in sorted(preds.keys(), key=lambda x: int(x)):
+            p = preds[k]
+            candidates.append({
+                "lat": float(p.get("ai_lat", 0)), "lon": float(p.get("ai_lon", 0)),
+                "city": p.get("city", ""), "country": p.get("ai_country", ""),
+                "confidence": float(p.get("ai_confidence", 0)),
+                "province": p.get("province", ""), "source": "Picarta",
+            })
+        return candidates
+    except requests.exceptions.HTTPError as e:
+        codes = {401: "cle invalide", 402: "credits epuises"}
+        console.print(f"[yellow]Picarta : {codes.get(e.response.status_code, f'HTTP {e.response.status_code}')}[/yellow]")
+        return []
+    except Exception as e:
+        console.print(f"[yellow]Picarta erreur : {e}[/yellow]")
+        return []
 
 def solar_analysis(lat, lon, timestamp):
     try:
@@ -61,146 +88,31 @@ def solar_analysis(lat, lon, timestamp):
         obs.date = (timestamp.astimezone(timezone.utc) if timestamp.tzinfo else timestamp).strftime("%Y/%m/%d %H:%M:%S")
         sun = ephem.Sun(obs)
         alt, az = math.degrees(float(sun.alt)), math.degrees(float(sun.az))
-        if alt < 0:
-            return f"Soleil sous l'horizon ({alt:.1f}°) — nuit/crépuscule"
-        return f"Soleil à {alt:.1f}° altitude, azimut {az:.1f}°"
-    except ImportError:
-        return "ephem non installé"
-    except Exception as e:
-        return f"Calcul impossible ({e})"
-
-# ─── NOMINATIM ───────────────────────────────────────────────────────────────
+        if alt < 0: return f"Soleil sous horizon ({alt:.1f}) - nuit"
+        return f"Soleil a {alt:.1f} altitude, azimut {az:.1f}"
+    except ImportError: return "ephem non installe"
+    except Exception as e: return f"Calcul impossible ({e})"
 
 def nominatim_geocode(query):
-    if not query or len(query.strip()) < 3:
-        return None, None, None
+    if not query or len(query.strip()) < 3: return None, None, None
     try:
-        r = requests.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={"q": query, "format": "json", "limit": 1},
-            headers={"User-Agent": "osint-geolocate/2.0"},
-            timeout=10
-        )
+        r = requests.get("https://nominatim.openstreetmap.org/search",
+                         params={"q": query, "format": "json", "limit": 1},
+                         headers={"User-Agent": "osint-geolocate/3.0"}, timeout=10)
         r.raise_for_status()
         res = r.json()
-        if res:
-            return float(res[0]["lat"]), float(res[0]["lon"]), res[0].get("display_name", query)
-    except Exception:
-        pass
+        if res: return float(res[0]["lat"]), float(res[0]["lon"]), res[0].get("display_name", query)
+    except: pass
     return None, None, None
 
-def build_geocode_query(analysis):
-    city    = (analysis.get("estimated_city") or "").strip()
-    country = (analysis.get("estimated_country") or "").strip()
-    region  = (analysis.get("estimated_region") or "").strip()
-    lms     = analysis.get("landmarks", [])
-    top_lm  = sorted(lms, key=lambda x: x.get("confidence", 0), reverse=True)[0].get("name", "").strip() if lms else ""
-    if city and country:    return f"{city}, {country}"
-    if top_lm and country:  return f"{top_lm}, {country}"
-    if city:                return city
-    if top_lm:              return top_lm
-    if region and country:  return f"{region}, {country}"
-    return country or region
-
-# ─── PROMPTS (3 PASSES) ──────────────────────────────────────────────────────
-
-PROMPT_PASS0 = """You are an expert image analyst. Describe everything you see in this image in full detail, as if explaining to someone who cannot see it.
-
-Respond ONLY with JSON, no markdown, no preamble:
-
-{
-  "scene_type": "outdoor/indoor/aerial/...",
-  "description": "complete natural language description of the full scene",
-  "main_subject": "what is the main subject or focus",
-  "setting": "urban/rural/suburban/industrial/natural/...",
-  "time_of_day": "dawn/morning/midday/afternoon/evening/night/unknown",
-  "season": "spring/summer/autumn/winter/unknown",
-  "weather": "sunny/cloudy/rainy/foggy/snowy/unknown",
-  "dominant_colors": "main colors present in scene",
-  "people_present": false,
-  "vehicles_present": false,
-  "text_present": false,
-  "notable_elements": ["element1", "element2", "element3"],
-  "image_quality": "high/medium/low",
-  "perspective": "street level/elevated/aerial/interior/..."
-}"""
-
-PROMPT_PASS1 = """You are an elite OSINT analyst specializing in image geolocation.
-
-SCENE DESCRIPTION (from previous analysis):
-{description}
-
-PASS 1 — Now extract ALL geographic clues from the image. Be exhaustive and precise.
-
-Respond ONLY with JSON, no markdown, no preamble:
-
-{
-  "landmarks": [{"name": "...", "confidence": 0.0, "detail": "..."}],
-  "text_visible": "exact text seen on signs, plaques, labels",
-  "language_script": "...",
-  "architecture": {
-    "style": "...", "era": "...", "materials": "...",
-    "roof_type": "...", "window_style": "...", "balcony_style": "..."
-  },
-  "infrastructure": {
-    "road_markings": "...", "traffic_signs_style": "...",
-    "traffic_lights_style": "...", "license_plates": "...",
-    "fire_hydrant_style": "...", "utility_poles": "...",
-    "mailbox_style": "...", "street_furniture": "..."
-  },
-  "vegetation": "...",
-  "climate_clues": "...",
-  "sky_and_light": "season, time of day, sun angle, shadow direction",
-  "people_clothing": "...",
-  "flags_emblems_coats_of_arms": "...",
-  "vehicles": "brands, models, steering side",
-  "cultural_clues": "religious, cultural or regional markers"
-}"""
-
-PROMPT_PASS2 = """You are an elite OSINT geolocation analyst.
-
-Based on these visual clues extracted from an image, determine the most precise location.
-
-CLUES:
-{clues}
-
-Think step by step:
-1. Country: based on text/language/script/flags/plates
-2. Region/City: based on architecture + infrastructure + vegetation
-3. Specific landmark or building?
-4. Cross-check all clues for consistency
-
-Respond ONLY with JSON, no markdown, no preamble:
-
-{{
-  "estimated_country": "...",
-  "estimated_region": "...",
-  "estimated_city": "...",
-  "estimated_district": "...",
-  "estimated_street": "...",
-  "estimated_lat": null,
-  "estimated_lon": null,
-  "confidence_level": "high/medium/low",
-  "key_clues_used": ["clue1", "clue2", "clue3"],
-  "reasoning": "step by step reasoning",
-  "alternative_locations": ["alt1", "alt2"]
-}}
-
-- estimated_lat/lon decimal degrees, null if uncertain
-- high = city level, medium = region level, low = country only"""
-
-# ─── OLLAMA ──────────────────────────────────────────────────────────────────
-
-DEFAULT_MODEL  = "gemma4:31b-cloud"
-OLLAMA_TIMEOUT = 300  # 3 passes x modèle 31b cloud
+def web_search(query, max_results=5):
+    if not DDG_AVAILABLE: return []
+    try:
+        with DDGS() as ddgs: return list(ddgs.text(query, max_results=max_results))
+    except: return []
 
 def image_to_b64(path):
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode()
-
-def get_mime(path):
-    return {".jpg":"image/jpeg",".jpeg":"image/jpeg",".png":"image/png",
-            ".webp":"image/webp",".gif":"image/gif"}.get(Path(path).suffix.lower(),"image/jpeg")
+    with open(path, "rb") as f: return base64.b64encode(f.read()).decode()
 
 def ollama_ping():
     try:
@@ -209,79 +121,12 @@ def ollama_ping():
         return True
     except: return False
 
-def ollama_call(model, prompt, b64=None):
+def ollama_call(model, prompt, b64=None, timeout=None):
     payload = {"model": model, "prompt": prompt, "stream": False, "options": {"temperature": 0.1}}
     if b64: payload["images"] = [b64]
-    r = requests.post("http://localhost:11434/api/generate", json=payload, timeout=OLLAMA_TIMEOUT)
+    r = requests.post("http://localhost:11434/api/generate", json=payload, timeout=timeout or OLLAMA_TIMEOUT)
     r.raise_for_status()
     return r.json().get("response", "")
-
-def analyze_ollama(path, model_override=None):
-    if not ollama_ping():
-        console.print("[red]Ollama non accessible sur localhost:11434[/red]")
-        console.print("[dim]Lancez : ollama serve[/dim]")
-        sys.exit(1)
-    model = model_override or DEFAULT_MODEL
-    console.print(f"[dim]Modèle : {model}[/dim]")
-    b64 = image_to_b64(path)
-
-    console.print("[dim cyan]Passe 1/3 — description visuelle générale...[/dim cyan]")
-    raw0  = ollama_call(model, PROMPT_PASS0, b64)
-    scene = parse_response(raw0)
-
-    console.print("[dim cyan]Passe 2/3 — extraction des indices géographiques...[/dim cyan]")
-    desc  = scene.get("description", json.dumps(scene, ensure_ascii=False))
-    raw1  = ollama_call(model, PROMPT_PASS1.format(description=desc), b64)
-    clues = parse_response(raw1)
-
-    console.print("[dim cyan]Passe 3/3 — raisonnement géographique...[/dim cyan]")
-    prompt2 = PROMPT_PASS2.format(clues=json.dumps({**scene, **clues}, ensure_ascii=False, indent=2))
-    raw2    = ollama_call(model, prompt2)
-    geo     = parse_response(raw2)
-    return {**scene, **clues, **geo, "_scene": scene}
-
-# ─── GEMINI ──────────────────────────────────────────────────────────────────
-
-def gemini_call(api_key, prompt, b64=None, mime="image/jpeg"):
-    url   = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
-    parts = [{"text": prompt}]
-    if b64: parts.append({"inline_data": {"mime_type": mime, "data": b64}})
-    r = requests.post(url, json={"contents":[{"parts":parts}],
-        "generationConfig":{"temperature":0.1,"maxOutputTokens":2048}}, timeout=60)
-    r.raise_for_status()
-    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-
-def analyze_gemini(path, api_key):
-    b64, mime = image_to_b64(path), get_mime(path)
-
-    console.print("[dim cyan]Passe 1/3 — description visuelle générale (Gemini)...[/dim cyan]")
-    try:
-        raw0  = gemini_call(api_key, PROMPT_PASS0, b64, mime)
-        scene = parse_response(raw0)
-    except requests.exceptions.HTTPError as e:
-        console.print(f"[red]Gemini error {e.response.status_code}[/red]")
-        sys.exit(1)
-
-    console.print("[dim cyan]Passe 2/3 — extraction des indices géographiques (Gemini)...[/dim cyan]")
-    desc  = scene.get("description", json.dumps(scene, ensure_ascii=False))
-    try:
-        raw1  = gemini_call(api_key, PROMPT_PASS1.format(description=desc), b64, mime)
-        clues = parse_response(raw1)
-    except Exception as e:
-        console.print(f"[yellow]Passe 2 échouée : {e}[/yellow]")
-        return scene
-
-    console.print("[dim cyan]Passe 3/3 — raisonnement géographique (Gemini)...[/dim cyan]")
-    prompt2 = PROMPT_PASS2.format(clues=json.dumps({**scene, **clues}, ensure_ascii=False, indent=2))
-    try:
-        raw2 = gemini_call(api_key, prompt2)
-        geo  = parse_response(raw2)
-        return {**scene, **clues, **geo, "_scene": scene}
-    except Exception as e:
-        console.print(f"[yellow]Passe 3 échouée : {e}[/yellow]")
-        return {**scene, **clues}
-
-# ─── PARSER ──────────────────────────────────────────────────────────────────
 
 def parse_response(raw):
     clean = re.sub(r"```(?:json)?", "", raw).strip()
@@ -290,215 +135,389 @@ def parse_response(raw):
         try: return json.loads(m.group())
         except: pass
     try: return json.loads(clean)
-    except: return {"reasoning": raw, "estimated_lat": None, "estimated_lon": None}
-
-def coords_from(analysis):
-    lat, lon = analysis.get("estimated_lat"), analysis.get("estimated_lon")
-    try:
-        if lat is not None and lon is not None:
-            return float(lat), float(lon)
-    except: pass
-    m = re.search(r"(-?\d{1,3}\.\d+)[°\s,]+[NS]?\s*[,/]\s*(-?\d{1,3}\.\d+)",
-                  analysis.get("reasoning",""))
-    if m: return float(m.group(1)), float(m.group(2))
-    return None, None
-
-# ─── OUTPUT ──────────────────────────────────────────────────────────────────
+    except: return {"reasoning": raw}
 
 def ps(label, content, color="cyan"):
     t = Text()
-    t.append(f"[{label:<8}]", style=f"bold {color}")
+    t.append(f"[{label:<9}]", style=f"bold {color}")
     t.append(f"  {content}")
     console.print(t)
 
-def nonempty(v):
-    return v and str(v).lower().strip() not in ("", "none", "null", "n/a", "unknown")
+PROMPT_OCR = (
+    "You are an expert image analyst with exceptional OCR capabilities.\n"
+    "PRIMARY mission: read ALL text visible in the image with maximum accuracy.\n\n"
+    "Respond ONLY with JSON, no markdown:\n\n"
+    "{\n"
+    '  "all_text_visible": "EVERY word, number, code, sign exactly as written",\n'
+    '  "codes_numbers": ["list", "of", "codes", "IDs"],\n'
+    '  "language_of_text": "...",\n'
+    '  "description": "brief scene description",\n'
+    '  "scene_type": "outdoor/indoor/...",\n'
+    '  "setting": "urban/rural/...",\n'
+    '  "time_of_day": "...",\n'
+    '  "season": "...",\n'
+    '  "weather": "...",\n'
+    '  "notable_elements": ["element1", "element2"]\n'
+    "}\n\n"
+    "Be EXTREMELY precise with text - every character matters for OSINT."
+)
 
-def print_clues(a):
-    # ── Passe 0 : description générale ──────────────────────────────────
-    scene = a.get("_scene", {})
-    desc  = scene.get("description") or a.get("description", "")
-    if desc and len(desc) > 10:
-        console.print(Panel(
-            f"[white]{desc}[/white]",
-            title="[bold dim]DESCRIPTION VISUELLE[/bold dim]",
-            box=box.SIMPLE, style="dim", padding=(0, 2)
-        ))
+PROMPT_GEO = (
+    "You are an elite OSINT geolocation analyst.\n\n"
+    "SCENE CONTEXT (from OCR):\n{context}\n\n"
+    "Now analyze this image for ALL geographic clues.\n\n"
+    "Respond ONLY with JSON, no markdown:\n\n"
+    "{\n"
+    '  "landmarks": [{"name": "...", "confidence": 0.0, "detail": "..."}],\n'
+    '  "architecture": {"style": "...", "era": "...", "materials": "...", "roof_type": "..."},\n'
+    '  "infrastructure": {\n'
+    '    "road_markings": "...", "traffic_signs_style": "...",\n'
+    '    "license_plates": "...", "fire_hydrant_style": "...",\n'
+    '    "utility_poles": "...", "mailbox_style": "...",\n'
+    '    "street_furniture": "...", "pavement_color": "..."\n'
+    "  },\n"
+    '  "vegetation": "...",\n'
+    '  "climate_clues": "...",\n'
+    '  "sky_and_light": "...",\n'
+    '  "flags_emblems": "...",\n'
+    '  "vehicles": "...",\n'
+    '  "cultural_clues": "...",\n'
+    '  "estimated_country": "...",\n'
+    '  "estimated_region": "...",\n'
+    '  "estimated_city": "...",\n'
+    '  "estimated_lat": null,\n'
+    '  "estimated_lon": null\n'
+    "}"
+)
+
+PROMPT_REASONING = (
+    "You are an expert OSINT geolocation analyst. Cross-reference ALL clues.\n\n"
+    "OCR RESULTS:\n{ocr}\n\n"
+    "GEOGRAPHIC CLUES:\n{geo}\n\n"
+    "PICARTA AI PREDICTIONS:\n{picarta}\n\n"
+    "WEB SEARCH:\n{web}\n\n"
+    "Think step by step:\n"
+    "1. What does visible text reveal?\n"
+    "2. What do geographic clues confirm?\n"
+    "3. Do Picarta predictions align?\n"
+    "4. Final conclusion\n\n"
+    "Respond ONLY with JSON, no markdown:\n\n"
+    "{\n"
+    '  "final_country": "...",\n'
+    '  "final_region": "...",\n'
+    '  "final_city": "...",\n'
+    '  "final_district": "...",\n'
+    '  "final_street": "...",\n'
+    '  "final_lat": null,\n'
+    '  "final_lon": null,\n'
+    '  "confidence": "high/medium/low",\n'
+    '  "key_evidence": ["e1", "e2", "e3"],\n'
+    '  "reasoning": "step-by-step reasoning",\n'
+    '  "alternative_locations": [\n'
+    '    {"label": "...", "lat": 0.0, "lon": 0.0, "reason": "..."}\n'
+    "  ]\n"
+    "}"
+)
+
+def run_pipeline(path, picarta_key=None, no_search=False):
+    b64 = image_to_b64(path)
+    ocr_result, geo_result, reasoning_result = {}, {}, {}
+    picarta_candidates = []
+    if not ollama_ping():
+        console.print("[red]Ollama non accessible sur localhost:11434[/red]")
+        sys.exit(1)
+
+    # Picarta
+    if picarta_key:
+        console.print(Rule("[dim]Picarta AI[/dim]", style="dim"))
+        picarta_candidates = picarta_geolocate(path, picarta_key, top_k=5)
+        if picarta_candidates:
+            best = picarta_candidates[0]
+            conf_pct = int(best["confidence"] * 100) if best["confidence"] <= 1 else int(best["confidence"])
+            ps("PICARTA", f"Top 1 : {best.get('city','')}, {best.get('country','')} ({conf_pct}%)", "bright_green")
+            ps("PICARTA", f"Coords : {best['lat']:.5f}, {best['lon']:.5f}", "bright_green")
+            for i, c in enumerate(picarta_candidates[1:], 2):
+                c2 = int(c["confidence"] * 100) if c["confidence"] <= 1 else int(c["confidence"])
+                ps("PICARTA", f"Top {i} : {c.get('city','')}, {c.get('country','')} ({c2}%)", "dim green")
+        else:
+            ps("PICARTA", "Aucun resultat", "yellow")
+        console.print()
+    else:
+        console.print("[dim]Picarta desactive -- ajoutez --picarta-key (gratuit : picarta.ai)[/dim]")
         console.print()
 
-    for key, label in [
-        ("scene_type",  "Type de scène"),
-        ("setting",     "Environnement"),
-        ("time_of_day", "Heure approx."),
-        ("season",      "Saison        "),
-        ("weather",     "Météo         "),
-        ("perspective", "Perspective   "),
-    ]:
-        v = scene.get(key) or a.get(key, "")
-        if nonempty(v):
-            ps("SCÈNE", f"{label} : {v}", "dim white")
-
-    notables = scene.get("notable_elements") or a.get("notable_elements", [])
-    if notables:
-        ps("SCÈNE", f"Éléments     : {', '.join(notables[:6])}", "dim white")
-
+    # Passe OCR (qwen3.5)
+    console.print(Rule(f"[dim]Passe 1/3 -- OCR ({MODEL_OCR})[/dim]", style="dim"))
+    try:
+        raw = ollama_call(MODEL_OCR, PROMPT_OCR, b64)
+        ocr_result = parse_response(raw)
+        txt = ocr_result.get("all_text_visible", "")
+        codes = ocr_result.get("codes_numbers", [])
+        if txt and txt.lower() not in ("none", "nothing", ""):
+            ps("OCR", f"Texte  : {txt[:200]}", "bright_yellow")
+        if codes:
+            ps("OCR", f"Codes  : {', '.join(str(c) for c in codes[:10])}", "bright_yellow")
+        lang = ocr_result.get("language_of_text", "")
+        if lang and lang.lower() not in ("none", "unknown", ""):
+            ps("OCR", f"Langue : {lang}", "bright_yellow")
+        console.print("[dim]OK Passe OCR[/dim]")
+    except Exception as e:
+        console.print(f"[yellow]Passe OCR : {e.__class__.__name__}[/yellow]")
     console.print()
 
-    # ── Passes 1 & 2 : indices géo ──────────────────────────────────────
-    lms = a.get("landmarks", [])
-    if lms:
-        top = sorted(lms, key=lambda x: x.get("confidence",0), reverse=True)[:3]
-        ps("VISUAL", "Landmarks    : " + ", ".join(f"{l['name']} ({int(l.get('confidence',0)*100)}%)" for l in top), "green")
+    # Passe GEO (gemma4)
+    console.print(Rule(f"[dim]Passe 2/3 -- Indices geo ({MODEL_GEO})[/dim]", style="dim"))
+    try:
+        ctx = json.dumps(ocr_result, ensure_ascii=False)[:1500]
+        raw = ollama_call(MODEL_GEO, PROMPT_GEO.replace("{context}", ctx), b64)
+        geo_result = parse_response(raw)
+        lms = geo_result.get("landmarks", [])
+        if lms:
+            top = sorted(lms, key=lambda x: x.get("confidence", 0), reverse=True)[:3]
+            ps("GEO", "Landmarks : " + ", ".join(f"{l['name']} ({int(l.get('confidence',0)*100)}%)" for l in top), "green")
+        infra = geo_result.get("infrastructure", {})
+        if isinstance(infra, dict):
+            for k, lbl in [("pavement_color","Trottoir"), ("license_plates","Plaques")]:
+                v = infra.get(k, "")
+                if v and v.lower() not in ("none","unknown",""): ps("GEO", f"{lbl} : {v}", "green")
+        arch = geo_result.get("architecture", {})
+        if isinstance(arch, dict) and arch.get("style","").lower() not in ("none","unknown",""):
+            ps("GEO", f"Archi : {arch['style']}", "green")
+        flags = geo_result.get("flags_emblems", "")
+        if flags and flags.lower() not in ("none","unknown",""): ps("GEO", f"Drapeaux : {flags}", "bright_green")
+        ec = geo_result.get("estimated_city","")
+        ey = geo_result.get("estimated_country","")
+        if ec or ey: ps("GEO", f"Estimation : {ec}, {ey}", "bright_green")
+        console.print("[dim]OK Passe GEO[/dim]")
+    except Exception as e:
+        console.print(f"[yellow]Passe GEO : {e.__class__.__name__}[/yellow]")
+    console.print()
 
-    for key, label in [
-        ("text_visible",              "Texte visible"),
-        ("language_script",           "Langue/Script"),
-        ("flags_emblems_coats_of_arms","Drapeaux/Arms"),
-        ("vehicles",                  "Véhicules    "),
-        ("cultural_clues",            "Culturel     "),
-        ("vegetation",                "Végétation   "),
-        ("climate_clues",             "Climat       "),
-        ("sky_and_light",             "Lumière/Ombre"),
-    ]:
-        v = a.get(key, "")
-        if nonempty(v):
-            ps("VISUAL", f"{label} : {v}", "green")
+    # Recherche web DDG
+    web_results = []
+    if DDG_AVAILABLE and not no_search:
+        console.print(Rule("[dim]Recherche web DDG[/dim]", style="dim"))
+        codes = ocr_result.get("codes_numbers", [])
+        txt_v = ocr_result.get("all_text_visible", "")
+        all_codes = list(set([str(c) for c in codes] + re.findall(r'[A-Z0-9]{6,}', txt_v.upper())))
+        for code in all_codes[:2]:
+            console.print(f'[dim]DDG : "{code}"...[/dim]')
+            hits = web_search(f'"{code}" France ville localisation', max_results=3)
+            if hits:
+                web_results.append({"query": code, "hits": [{"title": h.get("title",""), "snippet": h.get("body","")} for h in hits]})
+            time.sleep(0.5)
+        city = geo_result.get("estimated_city","") or ""
+        country = geo_result.get("estimated_country","") or ""
+        if city and country:
+            q = f"{city} {country} geographie localisation"
+            hits = web_search(q, max_results=3)
+            if hits:
+                web_results.append({"query": q, "hits": [{"title": h.get("title",""), "snippet": h.get("body","")} for h in hits]})
+        console.print()
 
-    arch = a.get("architecture", {})
-    if isinstance(arch, dict):
-        parts = [f"{k}: {v}" for k, v in arch.items() if nonempty(v)]
-        if parts: ps("VISUAL", "Architecture : " + " | ".join(parts), "green")
+    # Nominatim
+    nom_lat, nom_lon = None, None
+    city = geo_result.get("estimated_city","") or ""
+    country = geo_result.get("estimated_country","") or ""
+    if city or country:
+        q = f"{city}, {country}".strip(", ")
+        console.print(f'[dim]Nominatim : "{q}"...[/dim]')
+        nom_lat, nom_lon, nom_name = nominatim_geocode(q)
+        if nom_lat:
+            ps("NOMINATIM", f"{(nom_name or q)[:80]}", "magenta")
+            ps("NOMINATIM", f"{nom_lat:.5f}, {nom_lon:.5f}", "magenta")
+        console.print()
 
-    infra = a.get("infrastructure", {})
-    if isinstance(infra, dict):
-        parts = [f"{k}: {v}" for k, v in infra.items() if nonempty(v)]
-        if parts: ps("VISUAL", "Infra        : " + " | ".join(parts[:5]), "green")
+    # Passe RAISONNEMENT (kimi)
+    console.print(Rule(f"[dim]Passe 3/3 -- Raisonnement ({MODEL_REAS})[/dim]", style="dim"))
+    try:
+        pic_str = json.dumps(picarta_candidates[:3], ensure_ascii=False) if picarta_candidates else "Aucun"
+        web_str = json.dumps(web_results, ensure_ascii=False)[:2000] if web_results else "Aucun"
+        ocr_str = json.dumps({k:v for k,v in ocr_result.items()
+                               if k in ("all_text_visible","codes_numbers","language_of_text","description")},
+                              ensure_ascii=False)
+        geo_str = json.dumps({k:v for k,v in geo_result.items()
+                               if k in ("landmarks","architecture","infrastructure","flags_emblems",
+                                        "estimated_country","estimated_city","estimated_region","cultural_clues")},
+                              ensure_ascii=False)
+        prompt_r = (PROMPT_REASONING
+                    .replace("{ocr}", ocr_str)
+                    .replace("{geo}", geo_str)
+                    .replace("{picarta}", pic_str)
+                    .replace("{web}", web_str))
+        raw = ollama_call(MODEL_REAS, prompt_r, timeout=360)
+        reasoning_result = parse_response(raw)
+        conf = reasoning_result.get("confidence","")
+        color = {"high":"bright_green","medium":"yellow","low":"red"}.get(conf,"white")
+        ps("FINAL", f"Confiance : {conf.upper() if conf else '?'}", color)
+        key_ev = reasoning_result.get("key_evidence",[])
+        if key_ev: ps("FINAL", f"Preuves   : {', '.join(str(e) for e in key_ev[:4])}", "cyan")
+        reason = reasoning_result.get("reasoning","")
+        if reason and len(reason) < 400: ps("FINAL", f"Analyse   : {reason}", "dim cyan")
+        console.print("[dim]OK Raisonnement[/dim]")
+    except Exception as e:
+        console.print(f"[yellow]Raisonnement : {e.__class__.__name__}[/yellow]")
+    console.print()
 
-    key_clues = a.get("key_clues_used", [])
-    if key_clues:
-        ps("REASON", "Indices clés : " + ", ".join(key_clues[:5]), "cyan")
+    return ocr_result, geo_result, reasoning_result, picarta_candidates, nom_lat, nom_lon
 
-    conf = a.get("confidence_level", "")
-    if conf:
-        color = {"high": "bright_green", "medium": "yellow", "low": "red"}.get(conf, "white")
-        ps("REASON", f"Confiance    : {conf.upper()}", color)
+def best_coords(reasoning, geo, picarta_candidates, nom_lat, nom_lon):
+    try:
+        lat, lon = reasoning.get("final_lat"), reasoning.get("final_lon")
+        if lat and lon: return float(lat), float(lon), "raisonnement IA"
+    except: pass
+    try:
+        lat, lon = geo.get("estimated_lat"), geo.get("estimated_lon")
+        if lat and lon: return float(lat), float(lon), "gemma4"
+    except: pass
+    for c in picarta_candidates:
+        conf = c.get("confidence", 0)
+        conf_val = conf if conf > 1 else conf * 100
+        if conf_val > 60 and c.get("lat") and c.get("lon"):
+            return float(c["lat"]), float(c["lon"]), f"Picarta ({int(conf_val)}%)"
+    if nom_lat and nom_lon: return nom_lat, nom_lon, "Nominatim"
+    if picarta_candidates and picarta_candidates[0].get("lat"):
+        c = picarta_candidates[0]
+        return float(c["lat"]), float(c["lon"]), "Picarta"
+    return None, None, ""
 
-    alts = a.get("alternative_locations", [])
-    if alts:
-        ps("REASON", "Alternatives : " + " | ".join(alts[:3]), "dim cyan")
-
-    reason = a.get("reasoning", "")
-    if reason and len(reason) < 500:
-        ps("REASON", f"Analyse      : {reason}", "dim cyan")
-
-def print_result(lat, lon, label, source=""):
-    maps_url   = f"https://maps.google.com/?q={lat:.6f},{lon:.6f}"
-    osm_url    = f"https://www.openstreetmap.org/?mlat={lat:.6f}&mlon={lon:.6f}&zoom=15"
-    yandex_url = "https://yandex.com/images/search?rpt=imageview"
-
-    src_str = f"  [dim]({source})[/dim]" if source else ""
+def print_result(lat, lon, label, source="", alternatives=None):
+    maps_url = f"https://maps.google.com/?q={lat:.6f},{lon:.6f}"
+    osm_url  = f"https://www.openstreetmap.org/?mlat={lat:.6f}&mlon={lon:.6f}&zoom=16"
+    sv_url   = f"https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={lat:.6f},{lon:.6f}"
+    yandex   = "https://yandex.com/images/search?rpt=imageview"
+    src = f"  [dim]({source})[/dim]" if source else ""
     console.print(Panel(
-        f"[bold green]→ {label}[/bold green]{src_str}\n"
-        f"[white]   {abs(lat):.5f}° {'N' if lat>=0 else 'S'},  {abs(lon):.5f}° {'E' if lon>=0 else 'W'}[/white]",
-        box=box.ROUNDED, style="green", padding=(0,2)
+        f"[bold bright_green]-> {label}[/bold bright_green]{src}\n"
+        f"[white]   {abs(lat):.5f} {'N' if lat>=0 else 'S'},  {abs(lon):.5f} {'E' if lon>=0 else 'W'}[/white]",
+        box=box.DOUBLE_EDGE, style="bright_green", padding=(0,2)
     ))
     console.print()
-    for lbl, url, color in [("MAPS   ", maps_url,"bright_blue"),("OSM    ",osm_url,"bright_cyan"),("YANDEX ",yandex_url,"yellow")]:
+    for lbl, url, color in [
+        ("MAPS       ", maps_url, "bright_blue"),
+        ("OSM        ", osm_url,  "bright_cyan"),
+        ("STREET VIEW", sv_url,   "bright_green"),
+        ("YANDEX     ", yandex,   "yellow"),
+    ]:
         t = Text()
         t.append(f"[{lbl}]  ", style=f"bold {color}")
         t.append(url, style=f"{color} underline")
         console.print(t)
     console.print()
-    console.print("[dim]  Yandex → glisser-déposer la photo pour reverse image search[/dim]")
+    if alternatives:
+        console.print(Rule("[dim]Positions alternatives[/dim]", style="dim"))
+        for i, a in enumerate(alternatives[:5], 1):
+            alat, alon = a.get("lat"), a.get("lon")
+            alabel = a.get("label") or f"{a.get('city','')}, {a.get('country','')}".strip(", ")
+            reason = a.get("reason") or a.get("evidence","")
+            console.print(f"  [bold cyan][{i}][/bold cyan] {alabel}")
+            if reason: console.print(f"     [dim]{str(reason)[:100]}[/dim]")
+            if alat and alon:
+                try:
+                    console.print(f"     [dim blue underline]https://maps.google.com/?q={float(alat):.5f},{float(alon):.5f}[/dim blue underline]")
+                    console.print(f"     [dim green underline]https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={float(alat):.5f},{float(alon):.5f}[/dim green underline]")
+                except: pass
+        console.print()
+    console.print("[dim]  Yandex -> glisser-deposer la photo pour reverse image search[/dim]")
     console.print()
-
-# ─── CLI ─────────────────────────────────────────────────────────────────────
 
 @click.command()
 @click.argument("image", type=click.Path(exists=True, readable=True))
-
-
-@click.option("--model", default=None, help="Forcer un modèle Ollama (défaut: gemma4:31b-cloud)")
-@click.option("--no-solar",   is_flag=True, default=False, help="Désactiver calcul solaire")
-@click.option("--no-geocode", is_flag=True, default=False, help="Désactiver Nominatim")
-def main(image, model, no_solar, no_geocode):
+@click.option("--picarta-key", envvar="DG8D9JCYYRVUSPG0W780", default=None,
+              help="Cle API Picarta (gratuit : picarta.ai, 10 credits)")
+@click.option("--no-solar",   is_flag=True, default=False, help="Desactiver calcul solaire")
+@click.option("--no-search",  is_flag=True, default=False, help="Desactiver recherche DDG")
+@click.option("--ocr-model",  default=MODEL_OCR,  help="Modele OCR ollama")
+@click.option("--geo-model",  default=MODEL_GEO,  help="Modele GEO ollama")
+@click.option("--reas-model", default=MODEL_REAS, help="Modele RAISONNEMENT ollama")
+def main(image, picarta_key, no_solar, no_search, ocr_model, geo_model, reas_model):
     """
-    OSINT image geolocation v2 — EXIF + AI 3-pass + Nominatim + solar.
+    OSINT image geolocation v3 -- Pipeline multi-modeles + Picarta.
 
-    Moteur : Ollama + gemma4:31b-cloud (aucun GPU requis).
+    \b
+    Pipeline :
+      EXIF -> Picarta -> OCR (qwen3.5) -> GEO (gemma4) -> RAISONNEMENT (kimi)
+      -> Nominatim -> DDG -> Solar
+
+    \b
+    Cle Picarta gratuite (10 credits) : https://picarta.ai
+    export PICARTA_API_KEY="votre_cle"
 
     \b
     Exemples:
       osint-geolocate photo.jpg
-      osint-geolocate photo.jpg --model gemma4:27b-cloud
-      osint-geolocate photo.jpg --no-solar
+      osint-geolocate photo.jpg --picarta-key YOUR_KEY
+      PICARTA_API_KEY=xxx osint-geolocate photo.jpg
     """
+    global MODEL_OCR, MODEL_GEO, MODEL_REAS
+    MODEL_OCR, MODEL_GEO, MODEL_REAS = ocr_model, geo_model, reas_model
     path = Path(image)
     console.print()
     console.print(Panel(
-        f"[bold white]OSINT-GEOLOCATE v2[/bold white]  [dim]{path.name}[/dim]",
+        f"[bold white]OSINT-GEOLOCATE v3[/bold white]  [dim]{path.name}[/dim]\n"
+        f"[dim]OCR:{MODEL_OCR}  GEO:{MODEL_GEO}  RAIS:{MODEL_REAS}[/dim]",
         box=box.DOUBLE_EDGE, style="bright_blue", padding=(0,2)
     ))
     console.print()
 
-    # 1. EXIF
     lat, lon, timestamp = extract_exif(path)
     if lat is not None and lon is not None:
-        ps("EXIF", f"GPS trouvé : {lat:.6f}°, {lon:.6f}°", "bright_cyan")
+        ps("EXIF", f"GPS trouve : {lat:.6f}, {lon:.6f}", "bright_cyan")
         if timestamp: ps("EXIF", f"Timestamp  : {timestamp.strftime('%Y-%m-%d %H:%M:%S')}", "bright_cyan")
         console.print()
-        print_result(lat, lon, "Coordonnées EXIF", "GPS")
+        print_result(lat, lon, "Coordonnees EXIF", "GPS")
         return
-    ps("EXIF", "Aucune donnée GPS", "yellow")
-    if timestamp: ps("EXIF", f"Timestamp  : {timestamp.strftime('%Y-%m-%d %H:%M:%S')}", "dim yellow")
+    ps("EXIF", "Aucune donnee GPS", "yellow")
+    if timestamp: ps("EXIF", f"Timestamp : {timestamp.strftime('%Y-%m-%d %H:%M:%S')}", "dim yellow")
     console.print()
 
-    # 2. AI 3-pass — Ollama gemma4:31b-cloud
-    analysis = analyze_ollama(path, model_override=model)
+    ocr, geo, reasoning, picarta_cands, nom_lat, nom_lon = run_pipeline(
+        path, picarta_key=picarta_key, no_search=no_search
+    )
 
-    console.print()
-    print_clues(analysis)
-    console.print()
+    final_lat, final_lon, source = best_coords(reasoning, geo, picarta_cands, nom_lat, nom_lon)
 
-    ai_lat, ai_lon = coords_from(analysis)
-
-    # 3. Nominatim fallback
-    nom_lat, nom_lon, nom_name = None, None, None
-    if not no_geocode and (ai_lat is None or ai_lon is None):
-        query = build_geocode_query(analysis)
-        if query:
-            console.print(f"[dim]Géocodage Nominatim : \"{query}\"...[/dim]")
-            nom_lat, nom_lon, nom_name = nominatim_geocode(query)
-            if nom_lat:
-                ps("GEOCODE", f"Résultat    : {nom_name}", "bright_magenta")
-                ps("GEOCODE", f"Coordonnées : {nom_lat:.5f}°, {nom_lon:.5f}°", "bright_magenta")
-                console.print()
-
-    final_lat = ai_lat if ai_lat is not None else nom_lat
-    final_lon = ai_lon if ai_lon is not None else nom_lon
-    source    = "IA" if ai_lat is not None else ("Nominatim" if nom_lat else "")
-
-    # 4. Solar
-    if not no_solar and timestamp and final_lat is not None:
+    if not no_solar and timestamp and final_lat:
         ps("SOLAR", solar_analysis(final_lat, final_lon, timestamp), "magenta")
         console.print()
 
-    # 5. Result
-    city    = analysis.get("estimated_city") or ""
-    country = analysis.get("estimated_country") or ""
-    region  = analysis.get("estimated_region") or ""
+    alternatives = list(reasoning.get("alternative_locations", []) or [])
+    for c in picarta_cands[1:4]:
+        conf = c.get("confidence",0)
+        conf_pct = int(conf*100) if conf<=1 else int(conf)
+        alternatives.append({
+            "label": f"{c.get('city','')}, {c.get('country','')}",
+            "lat": c["lat"], "lon": c["lon"],
+            "reason": f"Picarta ({conf_pct}%)",
+        })
+
+    city    = reasoning.get("final_city") or geo.get("estimated_city") or ""
+    country = reasoning.get("final_country") or geo.get("estimated_country") or ""
+    region  = reasoning.get("final_region") or geo.get("estimated_region") or ""
     label   = ", ".join(filter(None, [city, country or region])) or "Estimation IA"
 
-    if final_lat is not None and final_lon is not None:
-        print_result(final_lat, final_lon, label, source)
+    if final_lat is not None:
+        print_result(final_lat, final_lon, label, source, alternatives=alternatives)
     else:
         console.print(Panel(
-            "[yellow]Coordonnées non déterminées.[/yellow]\n"
-            f"[dim]Région estimée : {label or 'Inconnue'}[/dim]\n\n"
-            "[white]→ Reverse image search :[/white]\n"
+            "[yellow]Coordonnees non determinees.[/yellow]\n"
+            f"[dim]Region estimee : {label or 'Inconnue'}[/dim]\n\n"
+            "[white]-> Reverse image search :[/white]\n"
             "[yellow underline]https://yandex.com/images/search?rpt=imageview[/yellow underline]",
             box=box.ROUNDED, style="yellow"
         ))
+        if alternatives:
+            console.print(Rule("[dim]Positions candidates[/dim]", style="dim"))
+            for i, a in enumerate(alternatives[:5], 1):
+                alat, alon = a.get("lat"), a.get("lon")
+                alabel = a.get("label") or f"{a.get('city','')}, {a.get('country','')}".strip(", ")
+                console.print(f"  [bold cyan][{i}][/bold cyan] {alabel}")
+                if a.get("reason"): console.print(f"     [dim]{a['reason'][:100]}[/dim]")
+                if alat and alon:
+                    try:
+                        console.print(f"     [dim blue underline]https://maps.google.com/?q={float(alat):.5f},{float(alon):.5f}[/dim blue underline]")
+                        console.print(f"     [dim green underline]https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={float(alat):.5f},{float(alon):.5f}[/dim green underline]")
+                    except: pass
         console.print()
 
 if __name__ == "__main__":
