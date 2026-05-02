@@ -1,27 +1,42 @@
 # osint-geolocate
-Outil CLI OSINT qui tente d'identifier la géolocalisation d'une image en combinant analyse EXIF, vision par IA et calcul solaire. Sort un lien Google Maps en résultat final.
+
+Outil CLI OSINT qui identifie la géolocalisation d'une image via un pipeline multi-modèles : EXIF, Picarta AI, vision LLM (3 passes), Nominatim, recherche web et calcul solaire.
+
 Fait partie de la suite `osint-*`.
 
 ## Exemple de sortie
+
 ```
-╔══════════════════════════════════════════════════════╗
-║  OSINT-GEOLOCATE  photo.jpg                          ║
-╚══════════════════════════════════════════════════════╝
-[EXIF   ]  Aucune donnée GPS trouvée
-[VISUAL ]  Landmarks   : Tour Eiffel (97%), Champ-de-Mars (82%)
-           Langue      : Français
-           Architecture: Haussmannien
-           Végétation  : Parcs urbains tempérés
-           Climat      : Océanique tempéré
-[SOLAR  ]  Soleil à 52.3° d'altitude, azimut 187.4°
-╭─────────────────────────────────────────╮
-│  → Paris, France                        │
-│     48.8584° N,  2.2945° E             │
-╰─────────────────────────────────────────╯
-[MAPS]  https://maps.google.com/?q=48.858400,2.294500
+╔══════════════════════════════════════════════════════════════════╗
+║  OSINT-GEOLOCATE v3  photo.jpg                                   ║
+║  OCR:gemma4:31b-cloud  GEO:gemma4:31b-cloud  RAIS:gpt-oss:20b   ║
+╚══════════════════════════════════════════════════════════════════╝
+
+[EXIF     ]  Aucune donnee GPS
+
+[PICARTA  ]  Top 1 : Boulogne-Billancourt, France (93%)
+[PICARTA  ]  Coords : 48.83179, 2.25316
+
+[OCR      ]  Texte  : 005300560052 // 14.1X
+[OCR      ]  Langue : French
+
+[GEO      ]  Trottoir  : Reddish-brown asphalt
+[GEO      ]  Estimation: Boulogne-Billancourt, France
+
+[FINAL    ]  Confiance : HIGH
+[FINAL    ]  Preuves   : red pavement, French text, Picarta top 1
+
+-> Boulogne-Billancourt, France
+   48.83179 N,  2.25316 E
+
+[MAPS       ]  https://maps.google.com/?q=48.831790,2.253160
+[OSM        ]  https://www.openstreetmap.org/?mlat=48.831790&mlon=2.253160
+[STREET VIEW]  https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=48.831790,2.253160
+[YANDEX     ]  https://yandex.com/images/search?rpt=imageview
 ```
 
 ## Installation
+
 ```bash
 git clone https://github.com/J0ELAMENACE/osint-geolocate
 cd osint-geolocate
@@ -29,87 +44,93 @@ sudo bash install.sh
 ```
 
 ## Prérequis
-- Linux (testé sur Kali Linux / Ubuntu 24.04)
+
+- Linux (testé sur Kali 2024)
 - Python 3.10+
-- [Ollama](https://ollama.com) (installé automatiquement par `install.sh`)
+- [Ollama](https://ollama.com) avec un compte connecté
+- Clé API Picarta gratuite (optionnelle) : [picarta.ai](https://picarta.ai)
 
-## Modes IA
+### Modèles Ollama
 
-### Mode Ollama cloud — défaut recommandé ✅
-Aucun GPU requis. Utilise `gemma4:31b-cloud` via l'API cloud Ollama.
-
-> ⚠️ Nécessite un compte gratuit sur [ollama.com](https://ollama.com) et une authentification :
-> ```bash
-> ollama auth login
-> ```
-
-### Mode Ollama local — GPU requis
 ```bash
-ollama pull llava              # léger (~4 GB)
-ollama pull llama3.2-vision    # meilleure précision
+ollama pull gemma4:31b-cloud   # vision + OCR + geo (gratuit)
+ollama pull gpt-oss:20b-cloud  # raisonnement (gratuit)
 ```
-Le script détecte automatiquement les modèles locaux installés.
 
-### Mode Gemini cloud — clé API requise
-Clé gratuite sur [Google AI Studio](https://aistudio.google.com/apikey).
+### Variable d'environnement
+
+```bash
+export PICARTA_API_KEY="votre_cle"  # gratuit sur picarta.ai
+```
 
 ## Usage
+
 ```bash
-# Mode cloud Ollama (défaut — gemma4:31b-cloud)
+# Standard
 osint-geolocate photo.jpg
 
-# Forcer un modèle Ollama spécifique
-osint-geolocate photo.jpg --model gemma4:31b-cloud
-osint-geolocate photo.jpg --model llava
+# Avec clé Picarta
+osint-geolocate photo.jpg --picarta-key YOUR_KEY
 
-# Mode Gemini 2.0 Flash
-osint-geolocate photo.jpg --cloud --gemini-key YOUR_KEY
+# Via variable d'environnement
+PICARTA_API_KEY=xxx osint-geolocate photo.jpg
 
-# Clé Gemini via variable d'environnement
-export GEMINI_API_KEY="AIza..."
-osint-geolocate photo.jpg --cloud
+# Options
+osint-geolocate photo.jpg --no-solar     # sans calcul solaire
+osint-geolocate photo.jpg --no-search    # sans recherche DDG
 
-# Sans calcul solaire
-osint-geolocate photo.jpg --no-solar
-
-# Aide
-osint-geolocate --help
+# Forcer des modèles
+osint-geolocate photo.jpg \
+  --ocr-model gemma4:31b-cloud \
+  --geo-model gemma4:31b-cloud \
+  --reas-model gpt-oss:20b-cloud
 ```
 
-## Flow interne
+## Pipeline
+
 ```
 photo.jpg
     │
-    ├─[1] EXIF ──── GPS présent ? ──→ résultat immédiat
-    │                    │
-    │                    ✗
-    ├─[2] AI VISION ─── Ollama cloud (gemma4:31b-cloud) ← défaut
-    │                    OU Ollama local (llava / llama3.2-vision)
-    │                    OU Gemini 2.0 Flash (--cloud)
-    │                    → landmarks, langue, architecture,
-    │                      végétation, signalisation, coordonnées
+    ├─[EXIF]       GPS present ? → résultat immédiat
     │
-    ├─[3] SOLAR ──── timestamp + coords disponibles ?
-    │                    → validation altitude/azimut solaire
+    ├─[PICARTA]    API spécialisée géolocalisation image
+    │              top 5 candidats + coords + confiance
+    │              relance avec hint France si scores faibles
     │
-    └─[4] OUTPUT ─── Rich terminal + lien Google Maps
+    ├─[PASSE OCR]  gemma4:31b-cloud
+    │              lecture texte, codes, panneaux, langue
+    │
+    ├─[PASSE GEO]  gemma4:31b-cloud
+    │              landmarks, architecture, infrastructure,
+    │              trottoir, mobilier urbain, drapeaux
+    │
+    ├─[DDG]        Recherche web sur texte visible
+    │
+    ├─[NOMINATIM]  Geocodage OSM
+    │
+    ├─[PASSE RAIS] gpt-oss:20b-cloud
+    │              cross-check OCR + GEO + Picarta + Web
+    │              positions candidates avec confiance
+    │
+    ├─[SOLAR]      Validation ombre/soleil (si timestamp EXIF)
+    │
+    └─[OUTPUT]     Position + Google Maps + OSM + Street View + Yandex
 ```
 
 ## Stack
-| Composant | Librairie |
-|-----------|-----------|
-| CLI | `click` |
-| Output coloré | `rich` |
-| EXIF / GPS | `Pillow`, `exifread` |
-| Requêtes HTTP | `requests` |
-| Calcul solaire | `ephem` |
-| IA locale/cloud | Ollama (`localhost:11434`) |
-| IA cloud alt. | Gemini 2.0 Flash API |
 
-## Variables d'environnement
-| Variable | Description |
-|----------|-------------|
-| `GEMINI_API_KEY` | Clé API Google AI Studio (mode `--cloud`) |
+| Composant | Outil |
+|-----------|-------|
+| CLI | `click` |
+| Output | `rich` |
+| EXIF | `Pillow` |
+| Solaire | `ephem` |
+| Géolocalisation IA | [Picarta API](https://picarta.ai) |
+| Vision / OCR / GEO | `gemma4:31b-cloud` via Ollama |
+| Raisonnement | `gpt-oss:20b-cloud` via Ollama |
+| Geocodage | Nominatim (OSM) |
+| Recherche web | `ddgs` |
 
 ## Licence
-MIT
+
+CC BY-NC 4.0 — Copyright (c) 2026 J0ELAMENACE
