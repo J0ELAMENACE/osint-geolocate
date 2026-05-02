@@ -13,16 +13,22 @@ from rich.rule import Rule
 from rich import box
 
 console = Console()
-MODEL_OCR  = "qwen3.5:27b"
-MODEL_GEO  = "gemma4:31b"
-MODEL_REAS = "kimi-k2.6"
+MODEL_OCR  = "gemma4:31b-cloud"
+MODEL_GEO  = "gemma4:31b-cloud"
+MODEL_REAS = "gemma4:31b-cloud"
 OLLAMA_TIMEOUT = 480
 
 try:
-    from duckduckgo_search import DDGS
+    from ddgs import DDGS
     DDG_AVAILABLE = True
 except ImportError:
-    DDG_AVAILABLE = False
+    try:
+        from duckduckgo_search import DDGS
+        DDG_AVAILABLE = True
+    except ImportError:
+        DDG_AVAILABLE = False
+        DDGS = None
+
 
 def dms_to_decimal(dms, ref):
     try:
@@ -65,11 +71,16 @@ def picarta_geolocate(path, api_token, top_k=5):
         preds = data.get("topk_predictions_dict", {})
         for k in sorted(preds.keys(), key=lambda x: int(x)):
             p = preds[k]
+            gps  = p.get("gps", [0, 0])
+            addr = p.get("address", {})
             candidates.append({
-                "lat": float(p.get("ai_lat", 0)), "lon": float(p.get("ai_lon", 0)),
-                "city": p.get("city", ""), "country": p.get("ai_country", ""),
-                "confidence": float(p.get("ai_confidence", 0)),
-                "province": p.get("province", ""), "source": "Picarta",
+                "lat":        float(gps[0]) if gps else 0,
+                "lon":        float(gps[1]) if len(gps) > 1 else 0,
+                "city":       addr.get("city", ""),
+                "country":    addr.get("country", ""),
+                "province":   addr.get("province", ""),
+                "confidence": float(p.get("confidence", 0)),
+                "source":     "Picarta",
             })
         return candidates
     except requests.exceptions.HTTPError as e:
@@ -231,6 +242,10 @@ def run_pipeline(path, picarta_key=None, no_search=False):
     if picarta_key:
         console.print(Rule("[dim]Picarta AI[/dim]", style="dim"))
         picarta_candidates = picarta_geolocate(path, picarta_key, top_k=5)
+        # Si résultats faibles, relancer avec hint France
+        if not picarta_candidates or all(c["confidence"] < 0.3 for c in picarta_candidates):
+            console.print("[dim]Résultats faibles — relance avec hint France...[/dim]")
+            picarta_candidates = picarta_geolocate(path, picarta_key, top_k=5, country_code="FR")
         if picarta_candidates:
             best = picarta_candidates[0]
             conf_pct = int(best["confidence"] * 100) if best["confidence"] <= 1 else int(best["confidence"])
@@ -319,7 +334,8 @@ def run_pipeline(path, picarta_key=None, no_search=False):
     nom_lat, nom_lon = None, None
     city = geo_result.get("estimated_city","") or ""
     country = geo_result.get("estimated_country","") or ""
-    if city or country:
+    skip_nom = city.lower() in ("unknown","") and country.lower() in ("unknown","")
+    if (city or country) and not skip_nom:
         q = f"{city}, {country}".strip(", ")
         console.print(f'[dim]Nominatim : "{q}"...[/dim]')
         nom_lat, nom_lon, nom_name = nominatim_geocode(q)
@@ -423,7 +439,7 @@ def print_result(lat, lon, label, source="", alternatives=None):
 
 @click.command()
 @click.argument("image", type=click.Path(exists=True, readable=True))
-@click.option("--picarta-key", envvar="API-KEY", default=None,
+@click.option("--picarta-key", envvar="PICARTA_API_KEY", default=None,
               help="Cle API Picarta (gratuit : picarta.ai, 10 credits)")
 @click.option("--no-solar",   is_flag=True, default=False, help="Desactiver calcul solaire")
 @click.option("--no-search",  is_flag=True, default=False, help="Desactiver recherche DDG")
