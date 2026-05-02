@@ -423,7 +423,7 @@ def print_result(lat, lon, label, source="", alternatives=None):
 
 @click.command()
 @click.argument("image", type=click.Path(exists=True, readable=True))
-@click.option("--picarta-key", envvar="DG8D9JCYYRVUSPG0W780", default=None,
+@click.option("--picarta-key", envvar="API-KEY", default=None,
               help="Cle API Picarta (gratuit : picarta.ai, 10 credits)")
 @click.option("--no-solar",   is_flag=True, default=False, help="Desactiver calcul solaire")
 @click.option("--no-search",  is_flag=True, default=False, help="Desactiver recherche DDG")
