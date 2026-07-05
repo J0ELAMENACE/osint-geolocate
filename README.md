@@ -43,6 +43,14 @@ cd osint-geolocate
 sudo bash install.sh
 ```
 
+### Installation manuelle (sans install.sh)
+
+```bash
+pip install -r requirements.txt
+chmod +x osint-geolocate
+./osint-geolocate photo.jpg
+```
+
 ## Prérequis
 
 - Linux (testé sur Kali 2024)
@@ -65,19 +73,22 @@ export PICARTA_API_KEY="votre_cle"  # gratuit sur picarta.ai
 
 ## Usage
 
+La clé Picarta se fournit **uniquement** via la variable d'environnement `PICARTA_API_KEY` (voir plus haut). Il n'existe pas d'option CLI pour la clé, afin d'éviter qu'elle apparaisse dans l'historique shell ou la liste des processus.
+
 ```bash
-# Standard
+# Standard (utilise PICARTA_API_KEY si définie)
 osint-geolocate photo.jpg
 
-# Avec clé Picarta
-osint-geolocate photo.jpg --picarta-key YOUR_KEY
-
-# Via variable d'environnement
+# Via variable d'environnement inline
 PICARTA_API_KEY=xxx osint-geolocate photo.jpg
+
+# Indice pays (biaise Picarta + recherche web, aucun biais par défaut)
+osint-geolocate photo.jpg --country France
 
 # Options
 osint-geolocate photo.jpg --no-solar     # sans calcul solaire
 osint-geolocate photo.jpg --no-search    # sans recherche DDG
+osint-geolocate photo.jpg --verbose      # logs détaillés (debug)
 
 # Forcer des modèles
 osint-geolocate photo.jpg \
@@ -95,7 +106,7 @@ photo.jpg
     │
     ├─[PICARTA]    API spécialisée géolocalisation image
     │              top 5 candidats + coords + confiance
-    │              relance avec hint France si scores faibles
+    │              relance avec hint pays si --country fourni et scores faibles
     │
     ├─[PASSE OCR]  gemma4:31b-cloud
     │              lecture texte, codes, panneaux, langue

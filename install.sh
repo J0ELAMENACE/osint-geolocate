@@ -150,8 +150,8 @@ echo -e "${BOLD}─────────────────────�
 echo
 echo -e "  ${BOLD}Usage :${RESET}"
 echo -e "    osint-geolocate photo.jpg"
-echo -e "    osint-geolocate photo.jpg --picarta-key YOUR_KEY"
 echo -e "    PICARTA_API_KEY=xxx osint-geolocate photo.jpg"
+echo -e "    osint-geolocate photo.jpg --country France"
 echo -e ""
 echo -e "  ${BOLD}Modèles :${RESET}"
 echo -e "    gemma4:31b-cloud  — vision / OCR / géo"

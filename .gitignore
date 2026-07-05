@@ -44,3 +44,7 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Outillage local (non publié)
+.claude/
+graphify-out/
